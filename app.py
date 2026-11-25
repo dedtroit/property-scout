@@ -107,7 +107,7 @@ def normalize(raw, source):
     photos=raw.get('photos') or []; photos=photos if isinstance(photos,list) else [photos]
     link=safeurl(raw.get('listing_url') or raw.get('url'))
     return dict(closing_status=close,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',address=address,city=city,price=price,source=source,distress=match.group(),financing=financing,remarks=remarks[:1800],photos=[safeurl(p) for p in photos if safeurl(p)],url=link,search_url='https://www.google.com/search?q='+quote_plus(address+' '+city+' CA real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address+' '+city+' CA'))
-def reserve_request():
+def reserve_request(detail=False):
     # Persist on a mounted Railway volume; rolling 31-day cap protects billing cycles.
     path=os.getenv('QUOTA_DB','/data/quota.sqlite3')
     Path(path).parent.mkdir(parents=True,exist_ok=True)
@@ -120,11 +120,34 @@ def reserve_request():
         daily=db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-86400,)).fetchone()[0]
         if count>=190:return False
         db.execute('CREATE TABLE IF NOT EXISTS diagnostic (id INTEGER PRIMARY KEY)')
-        if daily>=5:
+        if detail and (daily>=6 or count>=185):return False
+        if daily>=5 and not detail:
             if daily>=7 or db.execute('SELECT COUNT(*) FROM diagnostic').fetchone()[0]:return False
             db.execute('INSERT INTO diagnostic VALUES (1)')
         db.execute('INSERT INTO calls VALUES (?)',(now,))
         return True
+def detail_lookup(item,source,key):
+    from urllib.parse import quote
+    ident=item.get('listingId')
+    if not ident:return item,'No listing ID'
+    path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('details.sqlite3')
+    with sqlite3.connect(path) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS details (id TEXT PRIMARY KEY, ts REAL, payload TEXT)')
+        cachekey=source+':'+str(ident)
+        cached=db.execute('SELECT ts,payload FROM details WHERE id=?',(cachekey,)).fetchone()
+        if cached and time.time()-cached[0]<86400*7:return {**item,**json.loads(cached[1])},'Cached details'
+        if not reserve_request(detail=True):return item,'Detail quota reached'
+        try:
+            response=requests.get('https://foreclosure-finder1.p.rapidapi.com/listing/'+quote(source,safe='')+'/'+quote(str(ident),safe=''),params={'url':item['propertyLink']} if safeurl(item.get('propertyLink')) else {},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=35,allow_redirects=False)
+            response.raise_for_status();payload=response.json()
+            if not isinstance(payload,dict):raise ValueError('Unexpected detail format')
+            detail=payload.get('listing') or payload.get('data') or payload.get('property') or payload
+            if not isinstance(detail,dict):raise ValueError('Unexpected detail format')
+            detail={k:v for k,v in detail.items() if v is not None and v!='' and k not in ('source','listingId','address','city','state','status','statusLabel','propertyLink','openingBid','price','listPrice')}
+            db.execute('INSERT OR REPLACE INTO details VALUES (?,?,?)',(cachekey,time.time(),json.dumps(detail)))
+            return {**item,**detail},'Details retrieved'
+        except Exception as e:return item,'Detail lookup failed: '+type(e).__name__
+
 def hud_snapshot():
     endpoint='https://services.arcgis.com/VTyQ9soqVukalItT/arcgis/rest/services/SF_REO/FeatureServer/0/query'
     path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('hud_snapshot.json')
@@ -166,7 +189,7 @@ def public_sources():
         def handle_endtag(self,tag):
             if tag=='a' and self.href:
                 self.links.append((self.href,' '.join(' '.join(self.label).split())));self.href=None
-    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/8975/Public-Notices','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','California State Controller auction directory':'https://sco.ca.gov/ardtax_public_auction.html','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
+    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/1427/Tax-Land-Sale','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','California State Controller auction directory':'https://sco.ca.gov/ardtax_public_auction.html','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
     path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('public_sources.json')
     try:old=json.loads(path.read_text())
     except Exception:old={}
@@ -187,7 +210,7 @@ def public_sources():
             links=Links();links.feed(page.text)
             digest=hashlib.sha256(page.text.encode()).hexdigest()
             record['changed']=bool(previous.get('hash') and previous['hash']!=digest);record['hash']=digest
-            record['documents']=[{'title':label,'url':urljoin(url,href)} for href,label in links.links if label and safeurl(urljoin(url,href)) and re.search(r'auction|tax.default|delinquen|parcel|property list|homes for sale|search homes|search properties',label,re.I)][:40]
+            record['documents']=[{'title':label,'url':urljoin(url,href)} for href,label in links.links if label and 'excess proceeds' not in label.lower() and safeurl(urljoin(url,href)) and re.search(r'auction|tax.default|delinquen|parcel|property list|sale list|notice of sale|homes for sale|search homes|search properties',label,re.I)][:40]
             record['status']='Page checked; linked documents are unverified leads, not qualified homes'
         except Exception as e:record['status']=str(e)[:160] if isinstance(e,ValueError) else 'Fetch failed: '+type(e).__name__
         result[name]=record
@@ -241,6 +264,9 @@ def scan():
                         price=listing_price(item,source)
                         if price is None:reject('Missing asking price');continue
                         if closing_status(item)=='Closing too short':reject('Closing deadline under 21 days');continue
+                        if source in ('hud','fanniemae','freddiemac','redfin') and 0<price<260000:
+                            item,detail_status=detail_lookup(item,source,key)
+                            errors.append(str(address)+': '+detail_status)
                         restriction=restrictions(item)
                         if restriction and restriction!='HOA status unverified':reject(restriction);continue
                         if not 0<price<260000:reject('Price outside budget');continue
