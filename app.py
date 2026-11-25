@@ -225,6 +225,10 @@ def rentcast_scan():
     cache=path.with_suffix('.json')
     try:old=json.loads(cache.read_text())
     except Exception:old={'rows':[]}
+    def persist(message, rows, rejected, returned, outcome):
+        result={'rows':rows,'rejected':rejected,'returned':returned,'message':message,'outcome':outcome,'checked':datetime.now(timezone.utc).isoformat()}
+        tmp=cache.with_suffix('.tmp');tmp.write_text(json.dumps(result));tmp.replace(cache)
+        return result
     now=time.time()
     with sqlite3.connect(path,timeout=15) as db:
         db.execute('CREATE TABLE IF NOT EXISTS calls (ts REAL)')
@@ -233,39 +237,51 @@ def rentcast_scan():
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
         if count>=50 or now-last<31*86400/50:
-            return old['rows'],'RentCast: '+str(count)+'/50 rolling 31-day requests; next scan subject to quota',False
+            state['rentcast_diagnostics']={k:v for k,v in old.items() if k!='rows'}
+            state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/50,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
+            return old['rows'],'RentCast: '+str(count)+'/50 requests; '+old.get('message','Previous request outcome was not recorded')+'; waiting for quota interval',False
         db.execute('INSERT INTO calls VALUES (?)',(now,))
     try:
         response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'latitude':38.72,'longitude':-121.26,'radius':20,'status':'Active','propertyType':'Single Family','price':'1:259999','limit':500},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=45,allow_redirects=False)
         response.raise_for_status();batch=response.json()
         if not isinstance(batch,list):raise ValueError('Unexpected response')
-        rows=[]
+        rows=[]; rejected=[]
         for x in batch:
-            if str(x.get('city') or '').strip().title() not in CITIES or str(x.get('state')).upper()!='CA':continue
+            def reject(reason):
+                rejected.append({'source':'RentCast','address':x.get('formattedAddress') or x.get('addressLine1'),'city':x.get('city'),'price':listing_price(x),'type':x.get('propertyType'),'status':x.get('status'),'reason':reason})
+            if str(x.get('city') or '').strip().title() not in CITIES or str(x.get('state')).upper()!='CA':reject('Outside target cities');continue
             price=listing_price(x)
-            if price is None or not 0<price<260000:continue
-            if str(x.get('propertyType','')).lower()!='single family':continue
-            if str(x.get('status','')).lower()!='active':continue
+            if price is None or not 0<price<260000:reject('Missing price or outside budget');continue
+            if str(x.get('propertyType','')).lower()!='single family':reject('Not single family');continue
+            if str(x.get('status','')).lower()!='active':reject('Not active');continue
             restriction=restrictions(x)
-            if restriction and restriction!='HOA status unverified':continue
+            if restriction and restriction!='HOA status unverified':reject(restriction);continue
+            if CASH.search(' '.join(str(x.get(k) or '') for k in ('description','remarks','financing','terms'))):reject('Cash only or financing restriction');continue
+            if closing_status(x)=='Closing too short':reject('Closing deadline under 21 days');continue
             history=x.get('history') or {}
             past=[v.get('price') for v in history.values() if isinstance(v,dict) and isinstance(v.get('price'),(int,float))] if isinstance(history,dict) else []
             label='Price reduction indicated' if any(p>price for p in past) else 'Budget listing; distress unverified'
             typ=str(x.get('listingType') or '')
             if DISTRESS.search(typ):label=typ
             address=x.get('formattedAddress') or x.get('addressLine1')
-            if not address:continue
+            if not address:reject('Missing address');continue
             dom=x.get('daysOnMarket')
             remarks='Listing type: '+(typ or 'Unknown')+'; days on market: '+str(dom if dom is not None else 'Unknown')+'. Seller motivation and financing require verification.'
             rows.append(dict(address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
-        tmp=cache.with_suffix('.tmp');tmp.write_text(json.dumps({'rows':rows}));tmp.replace(cache)
-        return rows,'RentCast: '+str(count+1)+'/50 requests; '+str(len(batch))+' returned; '+str(len(rows))+' local budget candidates'+('; response at page limit; coverage may be incomplete' if len(batch)>=500 else ''),True
+        message=str(len(batch))+' returned; '+str(len(rows))+' local budget candidates; '+str(len(rejected))+' rejected'+('; response at page limit; coverage may be incomplete' if len(batch)>=500 else '')
+        record=persist(message,rows,rejected,len(batch),'success');state['rentcast_diagnostics']={k:v for k,v in record.items() if k!='rows'};state['rentcast_diagnostics'].update({'used':count+1,'limit':50})
+        return rows,'RentCast: '+str(count+1)+'/50 requests; '+message,True
     except Exception as e:
-        return old['rows'],'RentCast request failed: '+(str(e.response.status_code) if isinstance(e,requests.HTTPError) else type(e).__name__)+'; '+str(count+1)+'/50 requests',False
+        message='Request failed: '+(str(e.response.status_code) if isinstance(e,requests.HTTPError) else type(e).__name__)
+        record=persist(message,old['rows'],old.get('rejected',[]),old.get('returned'),'error');state['rentcast_diagnostics']={k:v for k,v in record.items() if k!='rows'};state['rentcast_diagnostics'].update({'used':count+1,'limit':50})
+        return old['rows'],'RentCast: '+message+'; '+str(count+1)+'/50 requests',False
 
 def scan():
     if not lock.acquire(False):return
-    state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]
+    state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]; completed_zips=[]; zip_records={}
+    provider_cache=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('foreclosure_scan.json')
+    try:zip_records=json.loads(provider_cache.read_text())
+    except Exception:pass
     try:
         try:
             state['public_sources']=public_sources()
@@ -283,7 +299,7 @@ def scan():
                     payload=response.json()
                     meta=payload.get('meta',{})
                     if meta.get('failedSources') or meta.get('totalCount',0)>len(payload.get('listings',[])):errors.append(zipcode+': incomplete source coverage or results truncated')
-                    accepted=0
+                    accepted=0; row_start=len(rows); reject_start=len(rejected)
                     for item in payload['listings']:
                         source=re.sub(r'[^a-z0-9]','',str(item.get('source','')).lower())
                         source={'homepath':'fanniemae','homesteps':'freddiemac','hudhomestore':'hud'}.get(source,source)
@@ -324,6 +340,8 @@ def scan():
                         else:reject('Property type, address or financing restriction')
                     successes+=1
                     errors.append(zipcode+': '+str(len(payload['listings']))+' source listings; '+str(accepted)+' matched; source failures: '+str(meta.get('failedSources',[])))
+                    zip_records[zipcode]={'rows':rows[row_start:],'rejected':rejected[reject_start:],'message':errors[-1],'checked':datetime.now(timezone.utc).isoformat()};completed_zips.append(zipcode)
+                    tmp=provider_cache.with_suffix('.tmp');tmp.write_text(json.dumps(zip_records));tmp.replace(provider_cache)
                     print(errors[-1],flush=True)
                 except requests.HTTPError as e:
                     errors.append(zipcode+': HTTP '+str(e.response.status_code));print(errors[-1],flush=True)
@@ -331,6 +349,13 @@ def scan():
                 except Exception as e:errors.append(zipcode+': '+type(e).__name__);print(errors[-1],flush=True)
                 if 'response' in locals() and response.status_code==429:break
         else:errors.append('RAPIDAPI_KEY not configured')
+        for zipcode,record in zip_records.items():
+            if zipcode not in completed_zips:
+                rows.extend(record.get('rows',[]));rejected.extend(record.get('rejected',[]));errors.append('Cached '+record.get('message',zipcode))
+        state['foreclosure_diagnostics']={k:{a:b for a,b in v.items() if a not in ('rows','rejected')} for k,v in zip_records.items()}
+        if not completed_zips and not zip_records:
+            rows.extend(x for x in state['listings'] if x.get('source')!='RentCast')
+            rejected.extend(x for x in state['rejected'] if x.get('source')!='RentCast')
         for feed in os.getenv('AUTHORIZED_FEEDS','').split(','):
             if not feed.strip():continue
             try:
@@ -340,9 +365,10 @@ def scan():
             except Exception as e:errors.append('Feed '+urlparse(feed).netloc+': '+type(e).__name__)
         rent_rows,rent_message,rent_success=rentcast_scan()
         errors.append(rent_message)
+        rejected.extend(state.get('rentcast_diagnostics',{}).get('rejected',[]))
         if rent_success or rent_rows:
-            if not successes:rows.extend(x for x in state['listings'] if x.get('source')!='RentCast')
             rows.extend(rent_rows);successes+=1
+        if zip_records:successes+=1
         unique={}
         for row in rows:
             key=(re.sub(r'[^a-z0-9]','',row['address'].lower()),row['city']); old=unique.get(key)
@@ -356,11 +382,14 @@ def scan():
             state['rejected']=rejected
             Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('rejected.json').write_text(json.dumps(rejected))
         state['errors']=errors;state['updated']=datetime.now(timezone.utc).isoformat()
+        diagnostics=provider_cache.with_name('scan_diagnostics.json');tmp=diagnostics.with_suffix('.tmp');tmp.write_text(json.dumps({k:state.get(k) for k in ('errors','updated','rentcast_diagnostics','foreclosure_diagnostics')}));tmp.replace(diagnostics)
     finally:state['running']=False;lock.release()
 def loop():
     try:
         cache=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('listings.json')
         if cache.exists():state['listings']=[x for x in json.loads(cache.read_text()) if (x.get('hoa_status') in ('HOA status unverified','No HOA reported') or x.get('hoa_verified') is True) and x.get('closing_status')!='Closing too short']
+        diagnostics=cache.with_name('scan_diagnostics.json')
+        if diagnostics.exists():state.update(json.loads(diagnostics.read_text()))
         reject_cache=cache.with_name('rejected.json')
         if reject_cache.exists():state['rejected']=json.loads(reject_cache.read_text())
     except Exception:pass
