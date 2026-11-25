@@ -236,13 +236,16 @@ def rentcast_scan():
         db.execute('DELETE FROM calls WHERE ts < ?',(now-31*86400,))
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
-        if count>=50 or now-last<31*86400/50:
+        # One bounded recovery request when the original result was never recorded.
+        recovery=count==1 and not old.get('outcome')
+        if count>=50 or (now-last<31*86400/50 and not recovery):
             state['rentcast_diagnostics']={k:v for k,v in old.items() if k!='rows'}
             state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/50,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
             return old['rows'],'RentCast: '+str(count)+'/50 requests; '+old.get('message','Previous request outcome was not recorded')+'; waiting for quota interval',False
         db.execute('INSERT INTO calls VALUES (?)',(now,))
     try:
-        response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'latitude':38.72,'longitude':-121.26,'radius':20,'status':'Active','propertyType':'Single Family','price':'1:259999','limit':500},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=45,allow_redirects=False)
+        print('RentCast: starting request '+str(count+1)+'/50',flush=True)
+        response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'latitude':38.72,'longitude':-121.26,'radius':20,'status':'Active','propertyType':'Single Family','price':'1:259999','limit':500,'includeTotalCount':'true'},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=45,allow_redirects=False)
         response.raise_for_status();batch=response.json()
         if not isinstance(batch,list):raise ValueError('Unexpected response')
         rows=[]; rejected=[]
@@ -269,10 +272,12 @@ def rentcast_scan():
             remarks='Listing type: '+(typ or 'Unknown')+'; days on market: '+str(dom if dom is not None else 'Unknown')+'. Seller motivation and financing require verification.'
             rows.append(dict(address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
         message=str(len(batch))+' returned; '+str(len(rows))+' local budget candidates; '+str(len(rejected))+' rejected'+('; response at page limit; coverage may be incomplete' if len(batch)>=500 else '')
+        print('RentCast: '+message,flush=True)
         record=persist(message,rows,rejected,len(batch),'success');state['rentcast_diagnostics']={k:v for k,v in record.items() if k!='rows'};state['rentcast_diagnostics'].update({'used':count+1,'limit':50})
         return rows,'RentCast: '+str(count+1)+'/50 requests; '+message,True
     except Exception as e:
         message='Request failed: '+(str(e.response.status_code) if isinstance(e,requests.HTTPError) else type(e).__name__)
+        print('RentCast: '+message,flush=True)
         record=persist(message,old['rows'],old.get('rejected',[]),old.get('returned'),'error');state['rentcast_diagnostics']={k:v for k,v in record.items() if k!='rows'};state['rentcast_diagnostics'].update({'used':count+1,'limit':50})
         return old['rows'],'RentCast: '+message+'; '+str(count+1)+'/50 requests',False
 
@@ -365,6 +370,7 @@ def scan():
             except Exception as e:errors.append('Feed '+urlparse(feed).netloc+': '+type(e).__name__)
         rent_rows,rent_message,rent_success=rentcast_scan()
         errors.append(rent_message)
+        print(rent_message,flush=True)
         rejected.extend(state.get('rentcast_diagnostics',{}).get('rejected',[]))
         if rent_success or rent_rows:
             rows.extend(rent_rows);successes+=1
@@ -382,6 +388,7 @@ def scan():
             state['rejected']=rejected
             Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('rejected.json').write_text(json.dumps(rejected))
         state['errors']=errors;state['updated']=datetime.now(timezone.utc).isoformat()
+        print('Scan complete: '+str(len(state['listings']))+' candidates; '+str(len(state['rejected']))+' rejected',flush=True)
         diagnostics=provider_cache.with_name('scan_diagnostics.json');tmp=diagnostics.with_suffix('.tmp');tmp.write_text(json.dumps({k:state.get(k) for k in ('errors','updated','rentcast_diagnostics','foreclosure_diagnostics')}));tmp.replace(diagnostics)
     finally:state['running']=False;lock.release()
 def loop():
@@ -393,7 +400,12 @@ def loop():
         reject_cache=cache.with_name('rejected.json')
         if reject_cache.exists():state['rejected']=json.loads(reject_cache.read_text())
     except Exception:pass
-    while True:scan();time.sleep(12*3600)
+    while True:
+        try:scan()
+        except Exception as e:
+            state['errors']=(state.get('errors') or [])+['Scanner crashed: '+type(e).__name__]
+            print('Scanner crashed: '+type(e).__name__,flush=True)
+        time.sleep(12*3600)
 @app.get('/api/listings')
 def listings():return jsonify(state)
 @app.get('/')
