@@ -189,7 +189,7 @@ def public_sources():
         def handle_endtag(self,tag):
             if tag=='a' and self.href:
                 self.links.append((self.href,' '.join(' '.join(self.label).split())));self.href=None
-    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/1427/Tax-Land-Sale','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','California State Controller auction directory':'https://sco.ca.gov/ardtax_public_auction.html','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
+    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
     path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('public_sources.json')
     try:old=json.loads(path.read_text())
     except Exception:old={}
