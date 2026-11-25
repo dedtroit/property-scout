@@ -43,7 +43,9 @@ def reserve_request():
         db.execute('DELETE FROM calls WHERE ts < ?', (now-31*86400,))
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         daily=db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-86400,)).fetchone()[0]
-        if count>=200 or daily>=5:return False
+        if count>=200 or daily>=6:return False
+        # One extra diagnostic request today only; normal scheduled scans remain five.
+        if daily>=5 and db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-31*86400,)).fetchone()[0] != 5:return False
         db.execute('INSERT INTO calls VALUES (?)',(now,))
         return True
 def scan():
@@ -57,7 +59,7 @@ def scan():
                     if not reserve_request():
                         errors.append('Daily or rolling request budget reached; retaining cached results')
                         break
-                    response=requests.get('https://foreclosure-finder1.p.rapidapi.com/zipcode/all',params={'zipcode':zipcode,'radius':15,'limit':500,'sort':'price_asc','sources':'hud,fanniemae,freddiemac,redfin'},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=65,allow_redirects=False)
+                    response=requests.get('https://foreclosure-finder1.p.rapidapi.com/zipcode/all',params={'zipcode':zipcode,'radius':25,'limit':500,'maxPrice':259999,'minPrice':1000,'sort':'price_asc','sources':'hud,fanniemae,freddiemac,redfin'},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=65,allow_redirects=False)
                     response.raise_for_status()
                     payload=response.json()
                     meta=payload.get('meta',{})
@@ -71,18 +73,21 @@ def scan():
                         status=str(item.get('status','')).lower().replace('_',' ')
                         label=str(item.get('statusLabel','')).lower().replace('_',' ')
                         if any(x in status+' '+label for x in ('pending','sold','closed','cancel','off market','auction','withdrawn','coming soon')):continue
-                        if not any(x in (status,label) for x in ('active','for sale','available','listed','new listing','reo','for sale active','active listing','bid open','exclusive','extended','price reduced')):continue
+                        # Non-auction REO search results can omit or use source-specific status labels.
+                        if any(x in status+' '+label for x in ('unavailable','not for sale','inactive','under contract')):continue
                         if source not in ('hud','fanniemae','freddiemac','redfin'):continue
                         price=item.get('listPrice') or item.get('price') or item.get('openingBid')
-                        typ=str(item.get('propertyType','')).lower().replace('_',' ')
+                        typ=str(item.get('propertyTypeGroup') or item.get('propertyType') or '').lower().replace('_',' ').replace('-',' ')
+                        if typ in ('single family residential','single family house','single family dwelling'):typ='single family home'
                         photos=item.get('photos') or item.get('photoUrl') or item.get('photo') or []
                         row=normalize({'address':address,'city':match.group(1),'state':'CA','price':price,'property_type':typ,'status':'active','distress_type':str(item.get('assetType') or '').replace('_',' ')+' '+('bank owned' if source!='redfin' else 'foreclosure'),'description':item.get('description'),'financing':item.get('financing'),'photos':photos,'listing_url':item.get('propertyLink')},source)
                         if row:rows.append(row);accepted+=1
                     successes+=1
-                    errors.append(zipcode+': '+str(len(payload['listings']))+' source listings; '+str(accepted)+' matched')
+                    errors.append(zipcode+': '+str(len(payload['listings']))+' source listings; '+str(accepted)+' matched; source failures: '+str(meta.get('failedSources',[])))
                     print(errors[-1],flush=True)
                 except requests.HTTPError as e:
                     errors.append(zipcode+': HTTP '+str(e.response.status_code));print(errors[-1],flush=True)
+                    if e.response.status_code in (401,403,429):break
                 except Exception as e:errors.append(zipcode+': '+type(e).__name__);print(errors[-1],flush=True)
                 if 'response' in locals() and response.status_code==429:break
         else:errors.append('RAPIDAPI_KEY not configured')
