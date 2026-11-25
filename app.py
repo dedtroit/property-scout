@@ -87,7 +87,9 @@ def scan():
                         if any(x in status+' '+label for x in ('unavailable','not for sale','inactive','under contract')):reject('Unavailable status');continue
                         if source not in ('hud','fanniemae','freddiemac','redfin'):reject('Unsupported source');continue
                         price=item.get('listPrice') or item.get('price')
-                        try:price=float(str(price).replace('
+                        try:price=float(str(price).replace(chr(36),'').replace(',',''))
+                        except (ValueError,TypeError):reject('Missing asking price');continue
+                        if not 0<price<260000:reject('Price outside budget');continue
                         typ=str(item.get('propertyTypeGroup') or item.get('propertyType') or '').lower().replace('_',' ').replace('-',' ')
                         if typ in ('single family residential','single family house','single family dwelling'):typ='single family home'
                         photos=item.get('photos') or item.get('photoUrl') or item.get('photo') or []
