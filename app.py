@@ -217,6 +217,52 @@ def public_sources():
     path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(result));tmp.replace(path)
     return result
 
+def rentcast_scan():
+    key=os.getenv('RENTCAST_API_KEY')
+    if not key:return [],'RentCast: RENTCAST_API_KEY not configured',False
+    path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('rentcast.sqlite3')
+    path.parent.mkdir(parents=True,exist_ok=True)
+    cache=path.with_suffix('.json')
+    try:old=json.loads(cache.read_text())
+    except Exception:old={'rows':[]}
+    now=time.time()
+    with sqlite3.connect(path,timeout=15) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS calls (ts REAL)')
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DELETE FROM calls WHERE ts < ?',(now-31*86400,))
+        count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
+        last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
+        if count>=50 or now-last<31*86400/50:
+            return old['rows'],'RentCast: '+str(count)+'/50 rolling 31-day requests; next scan subject to quota',False
+        db.execute('INSERT INTO calls VALUES (?)',(now,))
+    try:
+        response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'latitude':38.72,'longitude':-121.26,'radius':20,'status':'Active','propertyType':'Single Family','price':'1:259999','limit':500},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=45,allow_redirects=False)
+        response.raise_for_status();batch=response.json()
+        if not isinstance(batch,list):raise ValueError('Unexpected response')
+        rows=[]
+        for x in batch:
+            if str(x.get('city') or '').strip().title() not in CITIES or str(x.get('state')).upper()!='CA':continue
+            price=listing_price(x)
+            if price is None or not 0<price<260000:continue
+            if str(x.get('propertyType','')).lower()!='single family':continue
+            if str(x.get('status','')).lower()!='active':continue
+            restriction=restrictions(x)
+            if restriction and restriction!='HOA status unverified':continue
+            history=x.get('history') or {}
+            past=[v.get('price') for v in history.values() if isinstance(v,dict) and isinstance(v.get('price'),(int,float))] if isinstance(history,dict) else []
+            label='Price reduction indicated' if any(p>price for p in past) else 'Budget listing; distress unverified'
+            typ=str(x.get('listingType') or '')
+            if DISTRESS.search(typ):label=typ
+            address=x.get('formattedAddress') or x.get('addressLine1')
+            if not address:continue
+            dom=x.get('daysOnMarket')
+            remarks='Listing type: '+(typ or 'Unknown')+'; days on market: '+str(dom if dom is not None else 'Unknown')+'. Seller motivation and financing require verification.'
+            rows.append(dict(address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
+        tmp=cache.with_suffix('.tmp');tmp.write_text(json.dumps({'rows':rows}));tmp.replace(cache)
+        return rows,'RentCast: '+str(count+1)+'/50 requests; '+str(len(batch))+' returned; '+str(len(rows))+' local budget candidates'+('; response at page limit; coverage may be incomplete' if len(batch)>=500 else ''),True
+    except Exception as e:
+        return old['rows'],'RentCast request failed: '+(str(e.response.status_code) if isinstance(e,requests.HTTPError) else type(e).__name__)+'; '+str(count+1)+'/50 requests',False
+
 def scan():
     if not lock.acquire(False):return
     state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]
@@ -292,6 +338,11 @@ def scan():
                 rows.extend(filter(None,(normalize(x,urlparse(feed).netloc) for x in batch)))
                 successes+=1
             except Exception as e:errors.append('Feed '+urlparse(feed).netloc+': '+type(e).__name__)
+        rent_rows,rent_message,rent_success=rentcast_scan()
+        errors.append(rent_message)
+        if rent_success or rent_rows:
+            if not successes:rows.extend(x for x in state['listings'] if x.get('source')!='RentCast')
+            rows.extend(rent_rows);successes+=1
         unique={}
         for row in rows:
             key=(re.sub(r'[^a-z0-9]','',row['address'].lower()),row['city']); old=unique.get(key)
@@ -313,7 +364,7 @@ def loop():
         reject_cache=cache.with_name('rejected.json')
         if reject_cache.exists():state['rejected']=json.loads(reject_cache.read_text())
     except Exception:pass
-    while True:scan();time.sleep(86400)
+    while True:scan();time.sleep(12*3600)
 @app.get('/api/listings')
 def listings():return jsonify(state)
 @app.get('/')
