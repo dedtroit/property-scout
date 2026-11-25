@@ -106,6 +106,31 @@ def reserve_request():
             db.execute('INSERT INTO diagnostic VALUES (1)')
         db.execute('INSERT INTO calls VALUES (?)',(now,))
         return True
+def hud_snapshot():
+    endpoint='https://services.arcgis.com/VTyQ9soqVukalItT/arcgis/rest/services/SF_REO/FeatureServer/0/query'
+    path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('hud_snapshot.json')
+    try:old=json.loads(path.read_text())
+    except Exception:old={}
+    if time.time()-old.get('checked_epoch',0)<86400:return old
+    result={'checked_epoch':time.time(),'checked':datetime.now(timezone.utc).isoformat(),'url':'https://catalog.data.gov/dataset/fha-single-family-reo-properties-for-sale','documents':[],'records':old.get('records',[])}
+    try:
+        where="STATE_CODE = 'CA' AND UPPER(CITY) IN ("+','.join("'"+c.upper()+"'" for c in CITIES)+")"
+        response=requests.get(endpoint,params={'where':where,'outFields':'CASE_NUM,ADDRESS,STREET_NUM,STREET_NAME,CITY,STATE_CODE,DISPLAY_ZIP_CODE','returnGeometry':'false','f':'json'},timeout=30)
+        response.raise_for_status();payload=response.json()
+        if 'error' in payload or 'features' not in payload:raise ValueError('HUD query failed')
+        records=[]
+        for feature in payload['features']:
+            a=feature['attributes']; address=a.get('ADDRESS') or ' '.join(str(a.get(k) or '') for k in ('STREET_NUM','STREET_NAME')).strip()
+            if not address:continue
+            city=str(a.get('CITY') or '').title()
+            records.append({'address':address,'city':city,'case':a.get('CASE_NUM'),'url':'https://www.google.com/search?q='+quote_plus(address+' '+city+' CA HUD home'),'status':'Historical HUD snapshot; asking price, availability, HOA and property type must be verified'})
+        result['records']=records
+        result['status']=str(len(records))+' local snapshot records; not live listings and no asking prices supplied'
+        if payload.get('exceededTransferLimit'):result['status']+='; query truncated'
+    except Exception as e:result['status']='HUD dataset check failed: '+type(e).__name__+'; retaining prior snapshot'
+    path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(result));tmp.replace(path)
+    return result
+
 def public_sources():
     from urllib.robotparser import RobotFileParser
     from urllib.parse import urljoin
@@ -122,11 +147,11 @@ def public_sources():
         def handle_endtag(self,tag):
             if tag=='a' and self.href:
                 self.links.append((self.href,' '.join(' '.join(self.label).split())));self.href=None
-    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/8975/Public-Notices','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','HUD Home Store':'https://www.hudhomestore.gov/'}
+    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/8975/Public-Notices','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','California State Controller auction directory':'https://sco.ca.gov/ardtax_public_auction.html','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
     path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('public_sources.json')
     try:old=json.loads(path.read_text())
     except Exception:old={}
-    result=dict(old); now=time.time()
+    result={k:v for k,v in old.items() if k in urls}; now=time.time()
     for name,url in urls.items():
         previous=old.get(name,{})
         if now-previous.get('checked_epoch',0)<86400:continue
@@ -154,7 +179,9 @@ def scan():
     if not lock.acquire(False):return
     state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]
     try:
-        try:state['public_sources']=public_sources()
+        try:
+            state['public_sources']=public_sources()
+            state['public_sources']['HUD open data snapshot']=hud_snapshot()
         except Exception as e:errors.append('Public sources: '+type(e).__name__)
         key=os.getenv('RAPIDAPI_KEY')
         if key:
@@ -236,7 +263,7 @@ def scan():
 def loop():
     try:
         cache=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('listings.json')
-        if cache.exists():state['listings']=[x for x in json.loads(cache.read_text()) if x.get('hoa_verified') is True]
+        if cache.exists():state['listings']=[x for x in json.loads(cache.read_text()) if x.get('hoa_status') in ('HOA status unverified','No HOA reported') or x.get('hoa_verified') is True]
         reject_cache=cache.with_name('rejected.json')
         if reject_cache.exists():state['rejected']=json.loads(reject_cache.read_text())
     except Exception:pass
@@ -274,7 +301,7 @@ function render(){
  const s=add(card,'div',undefined,'content');add(s,'div',money(x.price),'price');add(s,'div',addr(x.address),'address');add(s,'small',x.city+', California');const tags=add(s,'div',undefined,'tags');tag(tags,x.distress||'Distressed');tag(tags,x.hoa_status||'HOA unknown',!x.hoa_verified);tag(tags,x.financing||'Financing unverified',!String(x.financing).startsWith('Conventional'));
  const nums=add(s,'div',undefined,'numbers');const dp=add(nums,'div');add(dp,'small',down+'% down');add(dp,'strong',money(x.price*down/100));const loan=add(nums,'div');add(loan,'small','Loan principal');add(loan,'strong',money(x.price*(1-down/100)));add(s,'small','Source: '+(x.source||'Unknown'));if(x.remarks){const d=add(s,'details');add(d,'summary','Property details');add(d,'p',x.remarks)}const actions=add(s,'div',undefined,'actions');link(actions,x.url||x.search_url,x.url?'View listing':'Find listing');link(actions,x.photo_search,'Photos');link(actions,'https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(addr(x.address)+' '+x.city+' CA'),'Map')}
  const rejected=el('rejected');rejected.replaceChildren();const bad=data.rejected||[];el('rejectTitle').textContent='Rejected listings ('+bad.length+')';for(const x of bad){const tr=add(rejected,'tr');add(tr,'td',addr(x.address));add(tr,'td',x.price?money(x.price):'Unknown');add(tr,'td',x.reason||'Unspecified');const td=add(tr,'td',x.source||'');if(x.url){td.append(document.createElement('br'));link(td,x.url,'View listing')}}if(!bad.length){const tr=add(rejected,'tr');const td=add(tr,'td','No rejected listings saved yet.');td.colSpan=4}
- const pub=el('publicSources');pub.replaceChildren();for(const [name,rec] of Object.entries(data.public_sources||{})){const section=add(pub,'div',undefined,'source');add(section,'strong',name);add(section,'p',rec.status||'Unknown','muted');link(section,rec.url,'Source');for(const doc of rec.documents||[])link(section,doc.url,doc.title)}if(!pub.children.length)add(pub,'p','No source check results yet.');
+ const pub=el('publicSources');pub.replaceChildren();for(const [name,rec] of Object.entries(data.public_sources||{})){const section=add(pub,'div',undefined,'source');add(section,'strong',name);add(section,'p',rec.status||'Unknown','muted');link(section,rec.url,'Source');for(const doc of rec.documents||[])link(section,doc.url,doc.title);for(const record of rec.records||[]){const p=add(section,'p',record.address+', '+record.city+' | '+record.status);link(p,record.url,'Find property')}}if(!pub.children.length)add(pub,'p','No source check results yet.');
 }
 async function refresh(){try{const response=await fetch('/api/listings');if(!response.ok)throw Error();data=await response.json();render()}catch(e){el('scanState').textContent='Unable to load scan'}}
 for(const id of ['city','down','sort','verified'])el(id).onchange=render;refresh();setInterval(refresh,30000);
