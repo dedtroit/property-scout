@@ -43,13 +43,63 @@ def reserve_request():
         db.execute('DELETE FROM calls WHERE ts < ?', (now-31*86400,))
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         daily=db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-86400,)).fetchone()[0]
-        if count>=200 or daily>=5:return False
+        if count>=190:return False
+        db.execute('CREATE TABLE IF NOT EXISTS diagnostic (id INTEGER PRIMARY KEY)')
+        if daily>=5:
+            if daily>=7 or db.execute('SELECT COUNT(*) FROM diagnostic').fetchone()[0]:return False
+            db.execute('INSERT INTO diagnostic VALUES (1)')
         db.execute('INSERT INTO calls VALUES (?)',(now,))
         return True
+def public_sources():
+    from urllib.robotparser import RobotFileParser
+    from urllib.parse import urljoin
+    from html.parser import HTMLParser
+    import hashlib
+    class Links(HTMLParser):
+        def __init__(self):
+            super().__init__();self.links=[];self.href=None;self.label=[]
+        def handle_starttag(self,tag,attrs):
+            if tag=='a':
+                self.href=dict(attrs).get('href');self.label=[]
+        def handle_data(self,data):
+            if self.href:self.label.append(data)
+        def handle_endtag(self,tag):
+            if tag=='a' and self.href:
+                self.links.append((self.href,' '.join(' '.join(self.label).split())));self.href=None
+    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Placer County tax notices':'https://www.placer.ca.gov/8975/Public-Notices','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','HUD Home Store':'https://www.hudhomestore.gov/'}
+    path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('public_sources.json')
+    try:old=json.loads(path.read_text())
+    except Exception:old={}
+    result=dict(old); now=time.time()
+    for name,url in urls.items():
+        previous=old.get(name,{})
+        if now-previous.get('checked_epoch',0)<86400:continue
+        record={'url':url,'checked_epoch':now,'checked':datetime.now(timezone.utc).isoformat(),'documents':previous.get('documents',[])}
+        try:
+            root=urlparse(url); robots=requests.get(root.scheme+'://'+root.netloc+'/robots.txt',timeout=12,headers={'User-Agent':'PropertyScoutBot/1.0'})
+            parser=RobotFileParser()
+            if robots.status_code==404:parser.parse([])
+            elif robots.status_code==200:parser.parse(robots.text.splitlines())
+            else:raise ValueError('Robots access unavailable: '+str(robots.status_code))
+            if not parser.can_fetch('PropertyScoutBot',url):raise ValueError('Automated access disallowed')
+            page=requests.get(url,timeout=20,headers={'User-Agent':'PropertyScoutBot/1.0'},allow_redirects=False);page.raise_for_status()
+            if page.status_code!=200:raise ValueError('Redirect or non-HTML response; manual review required')
+            links=Links();links.feed(page.text)
+            digest=hashlib.sha256(page.text.encode()).hexdigest()
+            record['changed']=bool(previous.get('hash') and previous['hash']!=digest);record['hash']=digest
+            record['documents']=[{'title':label,'url':urljoin(url,href)} for href,label in links.links if label and safeurl(urljoin(url,href)) and re.search(r'auction|tax.default|delinquen|parcel|property list|homes for sale|search homes|search properties',label,re.I)][:40]
+            record['status']='Page checked; linked documents are unverified leads, not qualified homes'
+        except Exception as e:record['status']=str(e)[:160] if isinstance(e,ValueError) else 'Fetch failed: '+type(e).__name__
+        result[name]=record
+    path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(result));tmp.replace(path)
+    return result
+
 def scan():
     if not lock.acquire(False):return
     state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]
     try:
+        try:state['public_sources']=public_sources()
+        except Exception as e:errors.append('Public sources: '+type(e).__name__)
         key=os.getenv('RAPIDAPI_KEY')
         if key:
             for zipcode in ['95678','95765','95843','95610','95630']:
@@ -137,8 +187,8 @@ def loop():
 @app.get('/api/listings')
 def listings():return jsonify(state)
 @app.get('/')
-def home():return render_template_string('''<!doctype html><html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Property Scout</title><style>body{font:16px system-ui;background:#f5f5f0;color:#24332f;margin:0}main{max-width:1100px;margin:auto;padding:24px}h1{font-size:40px;margin:8px 0}select,button{padding:10px;border:1px solid #abb8ae;border-radius:8px;background:white}#grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}article{background:white;border-radius:12px;overflow:hidden;border:1px solid #ddd}article img{width:100%;height:180px;object-fit:cover}section{padding:16px}a{color:#17634e}small{color:#52665b}#status{white-space:pre-wrap}</style><main><small>SACRAMENTO REGION / DISTRESSED HOMES</small><h1>Property Scout</h1><p>Below $260,000 • Conventional financing candidates</p><select id="city"><option>All cities</option>{% for c in cities %}<option>{{c}}</option>{% endfor %}</select> <select id="down"><option value="10">10% down</option><option value="12">12% down</option></select> <label><input type="checkbox" id="verified"> Conventional mentioned only</label><p id="status"></p><div id="grid"></div><details><summary>Rejected listings and reasons</summary><div id="rejected"></div></details><h2>Additional lead sources</h2><p><a href="https://homepath.fanniemae.com/">HomePath</a> · <a href="https://www.homesteps.com/">HomeSteps</a> · <a href="https://www.hudhomestore.gov/">HUD</a> · <a href="https://www.google.com/search?q=Sacramento+County+tax+sale">Sacramento tax sales</a> · <a href="https://www.google.com/search?q=Placer+County+tax+sale">Placer tax sales</a></p><small>Tax auctions frequently require cash; source links are not verified matches. Financing and property condition require lender review.</small></main><script>
-let data={listings:[]}; const el=id=>document.getElementById(id), money=n=>n.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0});function add(p,t,v){let x=document.createElement(t);x.textContent=v;p.append(x);return x}function link(p,u,t){let a=add(p,'a',t);a.href=u;a.target='_blank';a.rel='noopener noreferrer';p.append(' · ')}function render(){let grid=el('grid');grid.replaceChildren();let rejected=el('rejected');rejected.replaceChildren();for(let x of data.rejected||[]){let p=add(rejected,'p',JSON.stringify(x.address)+' | '+(x.price||'No price')+' | '+x.reason);if(x.url)link(p,x.url,'Open listing')}let rows=data.listings.filter(x=>(el('city').value==='All cities'||x.city===el('city').value)&&(!el('verified').checked||x.financing.startsWith('Conventional')));el('status').textContent=rows.length+' candidates | '+(data.updated||'Waiting for scan')+(data.running?' | Scanning':'')+'\\n'+(data.errors||[]).join('\\n');for(let x of rows){let card=document.createElement('article');if(x.photos.length){let img=document.createElement('img');img.src=x.photos[0];img.alt=x.address;img.onerror=()=>img.remove();card.append(img)}let s=document.createElement('section');card.append(s);add(s,'h2',money(x.price));add(s,'strong',x.address+', '+x.city);add(s,'p',x.distress+' | '+x.financing);add(s,'p','Down payment '+money(x.price*Number(el('down').value)/100));add(s,'small',x.source);add(s,'p',x.remarks);link(s,x.url||x.search_url,x.url?'Open listing':'Find listing');link(s,x.photo_search,'Photos');grid.append(card)}}async function refresh(){try{data=await (await fetch('/api/listings')).json();render()}catch(e){el('status').textContent='Unable to load scan'}}for(let id of ['city','down','verified'])el(id).onchange=render;refresh();setInterval(refresh,30000);
+def home():return render_template_string('''<!doctype html><html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Property Scout</title><style>body{font:16px system-ui;background:#f5f5f0;color:#24332f;margin:0}main{max-width:1100px;margin:auto;padding:24px}h1{font-size:40px;margin:8px 0}select,button{padding:10px;border:1px solid #abb8ae;border-radius:8px;background:white}#grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:16px}article{background:white;border-radius:12px;overflow:hidden;border:1px solid #ddd}article img{width:100%;height:180px;object-fit:cover}section{padding:16px}a{color:#17634e}small{color:#52665b}#status{white-space:pre-wrap}</style><main><small>SACRAMENTO REGION / DISTRESSED HOMES</small><h1>Property Scout</h1><p>Below $260,000 • Conventional financing candidates</p><select id="city"><option>All cities</option>{% for c in cities %}<option>{{c}}</option>{% endfor %}</select> <select id="down"><option value="10">10% down</option><option value="12">12% down</option></select> <label><input type="checkbox" id="verified"> Conventional mentioned only</label><p id="status"></p><div id="grid"></div><h2>Daily public source checks</h2><div id="publicSources"></div><details><summary>Rejected listings and reasons</summary><div id="rejected"></div></details><h2>Additional lead sources</h2><p><a href="https://homepath.fanniemae.com/">HomePath</a> · <a href="https://www.homesteps.com/">HomeSteps</a> · <a href="https://www.hudhomestore.gov/">HUD</a> · <a href="https://www.google.com/search?q=Sacramento+County+tax+sale">Sacramento tax sales</a> · <a href="https://www.google.com/search?q=Placer+County+tax+sale">Placer tax sales</a></p><small>Tax auctions frequently require cash; source links are not verified matches. Financing and property condition require lender review.</small></main><script>
+let data={listings:[]}; const el=id=>document.getElementById(id), money=n=>n.toLocaleString('en-US',{style:'currency',currency:'USD',maximumFractionDigits:0});function add(p,t,v){let x=document.createElement(t);x.textContent=v;p.append(x);return x}function link(p,u,t){let a=add(p,'a',t);a.href=u;a.target='_blank';a.rel='noopener noreferrer';p.append(' · ')}function render(){let grid=el('grid');grid.replaceChildren();let pub=el('publicSources');pub.replaceChildren();for(let [name,rec] of Object.entries(data.public_sources||{})){let section=document.createElement('section');add(section,'strong',name);add(section,'p',rec.status+' | '+rec.checked);link(section,rec.url,'Source');for(let doc of rec.documents||[]){link(section,doc.url,doc.title)}pub.append(section)}let rejected=el('rejected');rejected.replaceChildren();for(let x of data.rejected||[]){let p=add(rejected,'p',JSON.stringify(x.address)+' | '+(x.price||'No price')+' | '+x.reason);if(x.url)link(p,x.url,'Open listing')}let rows=data.listings.filter(x=>(el('city').value==='All cities'||x.city===el('city').value)&&(!el('verified').checked||x.financing.startsWith('Conventional')));el('status').textContent=rows.length+' candidates | '+(data.updated||'Waiting for scan')+(data.running?' | Scanning':'')+'\\n'+(data.errors||[]).join('\\n');for(let x of rows){let card=document.createElement('article');if(x.photos.length){let img=document.createElement('img');img.src=x.photos[0];img.alt=x.address;img.onerror=()=>img.remove();card.append(img)}let s=document.createElement('section');card.append(s);add(s,'h2',money(x.price));add(s,'strong',x.address+', '+x.city);add(s,'p',x.distress+' | '+x.financing);add(s,'p','Down payment '+money(x.price*Number(el('down').value)/100));add(s,'small',x.source);add(s,'p',x.remarks);link(s,x.url||x.search_url,x.url?'Open listing':'Find listing');link(s,x.photo_search,'Photos');grid.append(card)}}async function refresh(){try{data=await (await fetch('/api/listings')).json();render()}catch(e){el('status').textContent='Unable to load scan'}}for(let id of ['city','down','verified'])el(id).onchange=render;refresh();setInterval(refresh,30000);
 </script></html>''',cities=CITIES)
 if __name__=='__main__':
     threading.Thread(target=loop,daemon=True).start();app.run(host='0.0.0.0',port=int(os.getenv('PORT','8000')),debug=False,use_reloader=False)
