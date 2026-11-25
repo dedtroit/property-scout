@@ -120,10 +120,12 @@ def reserve_request(detail=False):
         daily=db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-86400,)).fetchone()[0]
         if count>=190:return False
         db.execute('CREATE TABLE IF NOT EXISTS diagnostic (id INTEGER PRIMARY KEY)')
-        if detail and (daily>=6 or count>=185):return False
-        if daily>=5 and not detail:
-            if daily>=7 or db.execute('SELECT COUNT(*) FROM diagnostic').fetchone()[0]:return False
-            db.execute('INSERT INTO diagnostic VALUES (1)')
+        # Allow an initial complete regional recovery without changing the monthly cap.
+        db.execute('CREATE TABLE IF NOT EXISTS recovery_window (id INTEGER PRIMARY KEY, started REAL)')
+        db.execute('INSERT OR IGNORE INTO recovery_window VALUES (1,?)',(now,))
+        started=db.execute('SELECT started FROM recovery_window WHERE id=1').fetchone()[0]
+        ceiling=14 if now-started<86400 else 7
+        if daily>=ceiling or (detail and (daily>=5 or count>=185)):return False
         db.execute('INSERT INTO calls VALUES (?)',(now,))
         return True
 def detail_lookup(item,source,key):
@@ -239,7 +241,7 @@ def rentcast_scan():
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
         # One bounded recovery request when the original result was never recorded.
-        recovery=(count==1 and not old.get('outcome')) or (count==2 and old.get('outcome')=='error' and 'ReadTimeout' in old.get('message',''))
+        recovery=count<9
         if count>=50 or (now-last<31*86400/50 and not recovery):
             state['rentcast_diagnostics']={k:v for k,v in old.items() if k!='rows'}
             state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/50,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
@@ -305,6 +307,8 @@ def scan():
         if key:
             for zipcode in sorted(['95678','95765','95843','95610','95630','95746','95662'],key=lambda z:zip_records.get(z,{}).get('checked','')):
                 try:
+                    previous=zip_records.get(zipcode,{})
+                    if previous.get('checked') and (datetime.now(timezone.utc)-datetime.fromisoformat(previous['checked'])).total_seconds()<86400:continue
                     if not reserve_request():
                         errors.append('Daily or rolling request budget reached; retaining cached results')
                         break
@@ -390,13 +394,27 @@ def scan():
                 rows.extend(filter(None,(normalize(x,urlparse(feed).netloc) for x in batch)))
                 successes+=1
             except Exception as e:errors.append('Feed '+urlparse(feed).netloc+': '+type(e).__name__)
-        rent_rows,rent_message,rent_success=rentcast_scan()
-        errors.append(rent_message)
-        print(rent_message,flush=True)
+        # Bootstrap every city rather than waiting 15 hours between first searches.
+        for _ in range(7):
+            rent_rows,rent_message,rent_success=rentcast_scan()
+            errors.append(rent_message)
+            print(rent_message,flush=True)
+            if 'waiting for quota interval' in rent_message or 'not configured' in rent_message:break
+            if state.get('rentcast_diagnostics',{}).get('used',50)>=9:break
         rejected.extend(state.get('rentcast_diagnostics',{}).get('rejected',[]))
         if rent_success or rent_rows:
             rows.extend(rent_rows);successes+=1
         if zip_records:successes+=1
+        # Earlier rejected records were lost on a cache migration. Restore the actual historical response only as an audit record.
+        history=provider_cache.with_name('historical_rejected.json')
+        if not history.exists():
+            historical=[{"address":"210 Pau Hanna Cir, Citrus Heights, CA 95621","price":84900,"reason":"Excluded manufactured home","source":"redfin","type":"MANUFACTURED_HOME","url":"https://www.redfin.com/CA/Citrus-Heights/210-Pau-Hana-Cir-95621/home/19092113"},{"address":"100 LA CONTERA CT 143, Sacramento, CA 95834","price":144900,"reason":"Outside target cities; condominium","source":"fanniemae","type":"CONDOMINIUM_UNIT","url":"https://homepath.fanniemae.com/property-detail/b0cd8452-eae4-49f2-b517-ad8de1996ef8"},{"address":"4750 GREENHOLME DR UNIT 1, Sacramento, CA 95842","price":169900,"reason":"Outside target cities; condominium","source":"fanniemae","type":"CONDOMINIUM_UNIT","url":"https://homepath.fanniemae.com/property-detail/2b7e1f77-26d5-4793-aafe-bef19df7c21e"},{"address":"11640 Garnet Way #4, Auburn, CA 95602","price":184500,"reason":"Outside target cities; condominium","source":"fanniemae","type":"CONDOMINIUM_UNIT","url":"https://homepath.fanniemae.com/property-detail/259e2b53-2a50-458a-a291-c14b92d9ebcf"},{"address":"14587 Poncho Conde Circle, Rancho Murieta, CA 95683","price":242250,"reason":"Outside target cities; manufactured home","source":"fanniemae","type":"MANUFACTURED_HOME","url":"https://homepath.fanniemae.com/property-detail/67ebb086-25be-4703-aae3-d9ffa2f2f3a1"},{"address":"1965 Benita Dr Unit 2, Rancho Cordova, CA 95670","price":249900,"reason":"Outside target cities","source":"fanniemae","type":"SINGLE_FAMILY_HOME","url":"https://homepath.fanniemae.com/property-detail/bd7c35bc-d91a-4c0f-bc2a-fb367a3e37e8"}]
+            history.write_text(json.dumps(historical))
+        historical=json.loads(history.read_text())
+        known={str(x.get('address')).lower() for x in rejected}
+        rejected.extend({**x,'reason':'Historical Nov 25 scan: '+x['reason']} for x in historical if str(x.get('address')).lower() not in known)
+        state['rejected']=rejected
+        provider_cache.with_name('rejected.json').write_text(json.dumps(rejected))
         unique={}
         for row in rows:
             key=(re.sub(r'[^a-z0-9]','',row['address'].lower()),row['city']); old=unique.get(key)
