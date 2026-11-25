@@ -1,4 +1,4 @@
-import os, re, time, threading, csv, io, sqlite3
+import os, re, time, threading, csv, io, sqlite3, json
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse
@@ -54,27 +54,36 @@ def scan():
         if key:
             for zipcode in ['95678','95765','95843','95610','95630']:
                 try:
-                    if not reserve_request():break
-                    response=requests.get('https://foreclosure-finder1.p.rapidapi.com/zipcode/all',params={'zipcode':zipcode,'radius':15,'limit':100,'sources':'hud,fanniemae,freddiemac,redfin'},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=65,allow_redirects=False)
+                    if not reserve_request():
+                        errors.append('Daily or rolling request budget reached; retaining cached results')
+                        break
+                    response=requests.get('https://foreclosure-finder1.p.rapidapi.com/zipcode/all',params={'zipcode':zipcode,'radius':15,'limit':500,'sort':'price_asc','sources':'hud,fanniemae,freddiemac,redfin'},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=65,allow_redirects=False)
                     response.raise_for_status()
                     payload=response.json()
                     meta=payload.get('meta',{})
                     if meta.get('failedSources') or meta.get('totalCount',0)>len(payload.get('listings',[])):errors.append(zipcode+': incomplete source coverage or results truncated')
+                    accepted=0
                     for item in payload['listings']:
                         source=str(item.get('source','')).lower()
                         address=str(item.get('address',''))
                         match=re.search(r',\s*([^,]+),\s*CA\s+\d{5}',address,re.I)
                         if not match:continue
-                        status=str(item.get('status','')).lower()
-                        if status not in ('active','for sale','available','listed'):continue
+                        status=str(item.get('status','')).lower().replace('_',' ')
+                        label=str(item.get('statusLabel','')).lower().replace('_',' ')
+                        if any(x in status+' '+label for x in ('pending','sold','closed','cancel','off market','auction','withdrawn','coming soon')):continue
+                        if not any(x in (status,label) for x in ('active','for sale','available','listed','new listing','reo','for sale active','active listing','bid open','exclusive','extended','price reduced')):continue
                         if source not in ('hud','fanniemae','freddiemac','redfin'):continue
-                        price=item.get('listPrice') or item.get('price') or (item.get('openingBid') if source in ('hud','fanniemae','freddiemac') else None)
+                        price=item.get('listPrice') or item.get('price') or item.get('openingBid')
                         typ=str(item.get('propertyType','')).lower().replace('_',' ')
                         photos=item.get('photos') or item.get('photoUrl') or item.get('photo') or []
-                        row=normalize({'address':address,'city':match.group(1),'state':'CA','price':price,'property_type':typ,'status':'active','distress_type':item.get('assetType') or ('bank owned' if source!='redfin' else 'foreclosure'),'description':item.get('description'),'financing':item.get('financing'),'photos':photos,'listing_url':item.get('propertyLink')},source)
-                        if row:rows.append(row)
+                        row=normalize({'address':address,'city':match.group(1),'state':'CA','price':price,'property_type':typ,'status':'active','distress_type':str(item.get('assetType') or '').replace('_',' ')+' '+('bank owned' if source!='redfin' else 'foreclosure'),'description':item.get('description'),'financing':item.get('financing'),'photos':photos,'listing_url':item.get('propertyLink')},source)
+                        if row:rows.append(row);accepted+=1
                     successes+=1
-                except Exception as e:errors.append(zipcode+': '+type(e).__name__)
+                    errors.append(zipcode+': '+str(len(payload['listings']))+' source listings; '+str(accepted)+' matched')
+                    print(errors[-1],flush=True)
+                except requests.HTTPError as e:
+                    errors.append(zipcode+': HTTP '+str(e.response.status_code));print(errors[-1],flush=True)
+                except Exception as e:errors.append(zipcode+': '+type(e).__name__);print(errors[-1],flush=True)
                 if 'response' in locals() and response.status_code==429:break
         else:errors.append('RAPIDAPI_KEY not configured')
         for feed in os.getenv('AUTHORIZED_FEEDS','').split(','):
@@ -88,10 +97,18 @@ def scan():
         for row in rows:
             key=(re.sub(r'[^a-z0-9]','',row['address'].lower()),row['city']); old=unique.get(key)
             if not old or (bool(row['url']),len(row['photos']))>(bool(old['url']),len(old['photos'])):unique[key]=row
-        if successes:state['listings']=sorted(unique.values(),key=lambda x:x['price'])
+        if successes:
+            state['listings']=sorted(unique.values(),key=lambda x:x['price'])
+            cache=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('listings.json')
+            cache.parent.mkdir(parents=True,exist_ok=True)
+            tmp=cache.with_suffix('.tmp');tmp.write_text(json.dumps(state['listings']));tmp.replace(cache)
         state['errors']=errors;state['updated']=datetime.now(timezone.utc).isoformat()
     finally:state['running']=False;lock.release()
 def loop():
+    try:
+        cache=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('listings.json')
+        if cache.exists():state['listings']=json.loads(cache.read_text())
+    except Exception:pass
     while True:scan();time.sleep(86400)
 @app.get('/api/listings')
 def listings():return jsonify(state)
