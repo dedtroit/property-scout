@@ -1,4 +1,5 @@
-import os, re, time, threading, csv, io
+import os, re, time, threading, csv, io, sqlite3
+from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import quote_plus, urlparse
 import requests
@@ -19,7 +20,7 @@ def normalize(raw, source):
     except (TypeError,ValueError): return
     if not 0<price<260000:return
     prop=raw.get('property') or {}; typ=str(prop.get('type') or raw.get('property_type') or '').lower(); sub=str(prop.get('subType') or '').lower()
-    if typ not in ('residential','single family','single family residence','singlefamily','house') or any(x in sub+' '+typ for x in ('condo','manufactured','mobile','townhouse','land')):return
+    if typ not in ('residential','single family','single family residence','singlefamily','house','single family home','single family detached') or any(x in sub+' '+typ for x in ('condo','manufactured','mobile','townhouse','land')):return
     status=str((raw.get('mls') or {}).get('status') or raw.get('status') or '').lower()
     if status not in ('active','for sale'):return
     remarks=' '.join(str(raw.get(k) or '') for k in ('remarks','description','distress_type','financing'))
@@ -31,23 +32,51 @@ def normalize(raw, source):
     photos=raw.get('photos') or []; photos=photos if isinstance(photos,list) else [photos]
     link=safeurl(raw.get('listing_url') or raw.get('url'))
     return dict(address=address,city=city,price=price,source=source,distress=match.group(),financing=financing,remarks=remarks[:1800],photos=[safeurl(p) for p in photos if safeurl(p)],url=link,search_url='https://www.google.com/search?q='+quote_plus(address+' '+city+' CA real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address+' '+city+' CA'))
+def reserve_request():
+    # Persist on a mounted Railway volume; rolling 31-day cap protects billing cycles.
+    path=os.getenv('QUOTA_DB','/data/quota.sqlite3')
+    Path(path).parent.mkdir(parents=True,exist_ok=True)
+    with sqlite3.connect(path,timeout=15) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS calls (ts REAL)')
+        db.execute('BEGIN IMMEDIATE')
+        now=time.time()
+        db.execute('DELETE FROM calls WHERE ts < ?', (now-31*86400,))
+        count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
+        daily=db.execute('SELECT COUNT(*) FROM calls WHERE ts >= ?', (now-86400,)).fetchone()[0]
+        if count>=200 or daily>=5:return False
+        db.execute('INSERT INTO calls VALUES (?)',(now,))
+        return True
 def scan():
     if not lock.acquire(False):return
     state['running']=True; rows=[]; errors=[]; successes=0
     try:
-        user=os.getenv('SIMPLYRETS_USER'); password=os.getenv('SIMPLYRETS_PASSWORD')
-        if user and password:
-            for city in CITIES:
+        key=os.getenv('RAPIDAPI_KEY')
+        if key:
+            for zipcode in ['95678','95765','95843','95610','95630']:
                 try:
-                    for page in range(20):
-                        r=requests.get('https://api.simplyrets.com/properties',auth=(user,password),params={'cities':city,'maxprice':259999,'status':'Active','limit':100,'offset':page*100},timeout=25);r.raise_for_status(); batch=r.json()
-                        if not isinstance(batch,list):raise ValueError('Expected listing array')
-                        rows.extend(filter(None,(normalize(x,'SimplyRETS') for x in batch)))
-                        if len(batch)<100:break
-                    else:errors.append(city+': pagination limit reached')
+                    if not reserve_request():break
+                    response=requests.get('https://foreclosure-finder1.p.rapidapi.com/zipcode/all',params={'zipcode':zipcode,'radius':15,'limit':100,'sources':'hud,fanniemae,freddiemac,redfin'},headers={'X-RapidAPI-Key':key,'X-RapidAPI-Host':'foreclosure-finder1.p.rapidapi.com'},timeout=65,allow_redirects=False)
+                    response.raise_for_status()
+                    payload=response.json()
+                    meta=payload.get('meta',{})
+                    if meta.get('failedSources') or meta.get('totalCount',0)>len(payload.get('listings',[])):errors.append(zipcode+': incomplete source coverage or results truncated')
+                    for item in payload['listings']:
+                        source=str(item.get('source','')).lower()
+                        address=str(item.get('address',''))
+                        match=re.search(r',\s*([^,]+),\s*CA\s+\d{5}',address,re.I)
+                        if not match:continue
+                        status=str(item.get('status','')).lower()
+                        if status not in ('active','for sale','available','listed'):continue
+                        if source not in ('hud','fanniemae','freddiemac','redfin'):continue
+                        price=item.get('listPrice') or item.get('price') or (item.get('openingBid') if source in ('hud','fanniemae','freddiemac') else None)
+                        typ=str(item.get('propertyType','')).lower().replace('_',' ')
+                        photos=item.get('photos') or item.get('photoUrl') or item.get('photo') or []
+                        row=normalize({'address':address,'city':match.group(1),'state':'CA','price':price,'property_type':typ,'status':'active','distress_type':item.get('assetType') or ('bank owned' if source!='redfin' else 'foreclosure'),'description':item.get('description'),'financing':item.get('financing'),'photos':photos,'listing_url':item.get('propertyLink')},source)
+                        if row:rows.append(row)
                     successes+=1
-                except Exception as e:errors.append(city+': '+type(e).__name__)
-        else:errors.append('SimplyRETS credentials not configured')
+                except Exception as e:errors.append(zipcode+': '+type(e).__name__)
+                if 'response' in locals() and response.status_code==429:break
+        else:errors.append('RAPIDAPI_KEY not configured')
         for feed in os.getenv('AUTHORIZED_FEEDS','').split(','):
             if not feed.strip():continue
             try:
@@ -63,7 +92,7 @@ def scan():
         state['errors']=errors;state['updated']=datetime.now(timezone.utc).isoformat()
     finally:state['running']=False;lock.release()
 def loop():
-    while True:scan();time.sleep(3600)
+    while True:scan();time.sleep(86400)
 @app.get('/api/listings')
 def listings():return jsonify(state)
 @app.get('/')
