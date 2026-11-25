@@ -14,7 +14,7 @@ def safeurl(s):
     return s if isinstance(s,str) and urlparse(s).scheme in ('https','http') and urlparse(s).netloc else ''
 def listing_price(raw, source=None):
     keys=('listPrice','listingPrice','askingPrice','salePrice','price','list_price','listing_price','asking_price','priceFormatted','formattedPrice','priceDisplay')
-    if source in ('hud','fanniemae','freddiemac'):keys=keys+('openingBid',)
+    if source in ('hud','fanniemae','freddiemac','redfin'):keys=keys+('openingBid',)
     for obj in (raw,raw.get('pricing'),raw.get('listing'),raw.get('property')):
         if not isinstance(obj,dict):continue
         normalized={re.sub(r'[^a-z0-9]','',str(k).lower()):v for k,v in obj.items()}
@@ -94,9 +94,9 @@ def normalize(raw, source):
     if price is None or not 0<price<260000:return
     restriction=restrictions(raw)
     if restriction and restriction!='HOA status unverified':return
-    prop=raw.get('property') or {}; typ=str(prop.get('type') or raw.get('property_type') or '').lower(); sub=str(prop.get('subType') or '').lower()
+    prop=raw.get('property') if isinstance(raw.get('property'),dict) else {}; typ=str(raw.get('property_type') or prop.get('type') or '').lower().replace('_',' ').replace('-',' '); sub=str(prop.get('subType') or '').lower().replace('_',' ').replace('-',' ')
     if typ not in ('residential','single family','single family residence','singlefamily','house','single family home','single family detached') or any(x in sub+' '+typ for x in ('condo','manufactured','mobile','townhouse','land')):return
-    status=str((raw.get('mls') or {}).get('status') or raw.get('status') or '').lower()
+    status=str(raw.get('status') or ((raw.get('mls') or {}).get('status') if isinstance(raw.get('mls'),dict) else '') or '').lower().replace('_',' ')
     if status not in ('active','for sale'):return
     remarks=' '.join(str(raw.get(k) or '') for k in ('remarks','description','distress_type','financing'))
     match=DISTRESS.search(remarks)
@@ -143,6 +143,8 @@ def detail_lookup(item,source,key):
             if not isinstance(payload,dict):raise ValueError('Unexpected detail format')
             detail=payload.get('listing') or payload.get('data') or payload.get('property') or payload
             if not isinstance(detail,dict):raise ValueError('Unexpected detail format')
+            nested=detail.get('details')
+            if isinstance(nested,dict):detail={**detail,**nested}
             detail={k:v for k,v in detail.items() if v is not None and v!='' and k not in ('source','listingId','address','city','state','status','statusLabel','propertyLink','openingBid','price','listPrice')}
             db.execute('INSERT OR REPLACE INTO details VALUES (?,?,?)',(cachekey,time.time(),json.dumps(detail)))
             return {**item,**detail},'Details retrieved'
@@ -189,7 +191,7 @@ def public_sources():
         def handle_endtag(self,tag):
             if tag=='a' and self.href:
                 self.links.append((self.href,' '.join(' '.join(self.label).split())));self.href=None
-    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','HomePath':'https://homepath.fanniemae.com/','HomeSteps':'https://www.homesteps.com/','Sacramento auction platform':'https://sacramento.mytaxsale.com/doc/tax_deed/rules'}
+    urls={'Sacramento County tax sales':'https://finance.saccounty.gov/us/en/tax/tax/tax-sales.html','Sacramento auction platform':'https://sacramento.mytaxsale.com/auctions'}
     path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('public_sources.json')
     try:old=json.loads(path.read_text())
     except Exception:old={}
@@ -237,15 +239,20 @@ def rentcast_scan():
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
         last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
         # One bounded recovery request when the original result was never recorded.
-        recovery=count==1 and not old.get('outcome')
+        recovery=(count==1 and not old.get('outcome')) or (count==2 and old.get('outcome')=='error' and 'ReadTimeout' in old.get('message',''))
         if count>=50 or (now-last<31*86400/50 and not recovery):
             state['rentcast_diagnostics']={k:v for k,v in old.items() if k!='rows'}
             state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/50,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
             return old['rows'],'RentCast: '+str(count)+'/50 requests; '+old.get('message','Previous request outcome was not recorded')+'; waiting for quota interval',False
+        db.execute('CREATE TABLE IF NOT EXISTS city_cursor (id INTEGER PRIMARY KEY, next_index INTEGER)')
+        cursor=db.execute('SELECT next_index FROM city_cursor WHERE id=1').fetchone()
+        index=cursor[0] if cursor else 0
+        city=['Citrus Heights','Antelope','Roseville','Rocklin','Orangevale','Folsom','Granite Bay'][index%7]
+        db.execute('INSERT OR REPLACE INTO city_cursor VALUES (1,?)',(index+1,))
         db.execute('INSERT INTO calls VALUES (?)',(now,))
     try:
         print('RentCast: starting request '+str(count+1)+'/50',flush=True)
-        response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'latitude':38.72,'longitude':-121.26,'radius':20,'status':'Active','propertyType':'Single Family','price':'1:259999','limit':500,'includeTotalCount':'true'},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=45,allow_redirects=False)
+        response=requests.get('https://api.rentcast.io/v1/listings/sale',params={'city':city,'state':'CA','status':'Active','propertyType':'Single Family','price':'1:259999','limit':100},headers={'X-Api-Key':key,'Accept':'application/json'},timeout=(10,90),allow_redirects=False)
         response.raise_for_status();batch=response.json()
         if not isinstance(batch,list):raise ValueError('Unexpected response')
         rows=[]; rejected=[]
@@ -271,7 +278,9 @@ def rentcast_scan():
             dom=x.get('daysOnMarket')
             remarks='Listing type: '+(typ or 'Unknown')+'; days on market: '+str(dom if dom is not None else 'Unknown')+'. Seller motivation and financing require verification.'
             rows.append(dict(address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
-        message=str(len(batch))+' returned; '+str(len(rows))+' local budget candidates; '+str(len(rejected))+' rejected'+('; response at page limit; coverage may be incomplete' if len(batch)>=500 else '')
+        message=city+': '+str(len(batch))+' returned; '+str(len(rows))+' local budget candidates; '+str(len(rejected))+' rejected'+('; response at page limit; coverage may be incomplete' if len(batch)>=100 else '')
+        rows=[x for x in old.get('rows',[]) if x.get('city')!=city]+rows
+        rejected=[x for x in old.get('rejected',[]) if str(x.get('city') or '').title()!=city]+rejected
         print('RentCast: '+message,flush=True)
         record=persist(message,rows,rejected,len(batch),'success');state['rentcast_diagnostics']={k:v for k,v in record.items() if k!='rows'};state['rentcast_diagnostics'].update({'used':count+1,'limit':50})
         return rows,'RentCast: '+str(count+1)+'/50 requests; '+message,True
@@ -294,7 +303,7 @@ def scan():
         except Exception as e:errors.append('Public sources: '+type(e).__name__)
         key=os.getenv('RAPIDAPI_KEY')
         if key:
-            for zipcode in ['95678','95765','95843','95610','95630']:
+            for zipcode in sorted(['95678','95765','95843','95610','95630','95746','95662'],key=lambda z:zip_records.get(z,{}).get('checked','')):
                 try:
                     if not reserve_request():
                         errors.append('Daily or rolling request budget reached; retaining cached results')
@@ -331,7 +340,9 @@ def scan():
                         price=listing_price(item,source)
                         if price is None:reject('Missing asking price');continue
                         if closing_status(item)=='Closing too short':reject('Closing deadline under 21 days');continue
-                        if source in ('hud','fanniemae','freddiemac','redfin') and 0<price<260000:
+                        early_type=str(item.get('propertyType') or item.get('propertyTypeGroup') or '').lower().replace('_',' ').replace('-',' ')
+                        if any(t in early_type for t in ('manufactured','mobile','condo','townhouse','land')):reject('Excluded property type');continue
+                        if source in ('hud','fanniemae','freddiemac') and 0<price<260000:
                             item,detail_status=detail_lookup(item,source,key)
                             errors.append(str(address)+': '+detail_status)
                         restriction=restrictions(item)
@@ -345,7 +356,13 @@ def scan():
                         else:reject('Property type, address or financing restriction')
                     successes+=1
                     errors.append(zipcode+': '+str(len(payload['listings']))+' source listings; '+str(accepted)+' matched; source failures: '+str(meta.get('failedSources',[])))
-                    zip_records[zipcode]={'rows':rows[row_start:],'rejected':rejected[reject_start:],'message':errors[-1],'checked':datetime.now(timezone.utc).isoformat()};completed_zips.append(zipcode)
+                    failed=set(re.sub(r'[^a-z0-9]','',str(v).lower()) for v in (meta.get('failedSources') or []))
+                    previous=zip_records.get(zipcode,{})
+                    if failed or meta.get('partial') or meta.get('totalCount',0)>len(payload['listings']):
+                        prior_rows=[x for x in previous.get('rows',[]) if x.get('source') in failed or meta.get('partial') or meta.get('totalCount',0)>len(payload['listings'])]
+                        rows.extend(prior_rows)
+                        rejected.extend(x for x in previous.get('rejected',[]) if x.get('source') in failed)
+                    zip_records[zipcode]={'rows':rows[row_start:],'rejected':rejected[reject_start:],'message':errors[-1],'checked':datetime.now(timezone.utc).isoformat(),'source_counts':{name:sum(1 for item in payload['listings'] if re.sub(r'[^a-z0-9]','',str(item.get('source','')).lower())==name) for name in ('hud','fanniemae','freddiemac','redfin')},'failed_sources':list(failed)};completed_zips.append(zipcode)
                     tmp=provider_cache.with_suffix('.tmp');tmp.write_text(json.dumps(zip_records));tmp.replace(provider_cache)
                     print(errors[-1],flush=True)
                 except requests.HTTPError as e:
@@ -358,6 +375,11 @@ def scan():
             if zipcode not in completed_zips:
                 rows.extend(record.get('rows',[]));rejected.extend(record.get('rejected',[]));errors.append('Cached '+record.get('message',zipcode))
         state['foreclosure_diagnostics']={k:{a:b for a,b in v.items() if a not in ('rows','rejected')} for k,v in zip_records.items()}
+        for name,source in [('HomePath','fanniemae'),('HomeSteps','freddiemac'),('HUD listing feed','hud'),('Redfin','redfin')]:
+            checked=[v for v in zip_records.values() if 'source_counts' in v]
+            count=sum(v['source_counts'].get(source,0) for v in checked)
+            failed=sum(source in v.get('failed_sources',[]) for v in checked)
+            state.setdefault('public_sources',{})[name]={'url':'https://foreclosureapi.com/','status':(str(count)+' returned source records across '+str(len(checked))+' cached ZIP searches (may overlap); '+str(failed)+' failed source checks') if checked else 'Awaiting first recorded inventory response','documents':[]}
         if not completed_zips and not zip_records:
             rows.extend(x for x in state['listings'] if x.get('source')!='RentCast')
             rejected.extend(x for x in state['rejected'] if x.get('source')!='RentCast')
@@ -405,7 +427,7 @@ def loop():
         except Exception as e:
             state['errors']=(state.get('errors') or [])+['Scanner crashed: '+type(e).__name__]
             print('Scanner crashed: '+type(e).__name__,flush=True)
-        time.sleep(12*3600)
+        time.sleep(3*3600)
 @app.get('/api/listings')
 def listings():return jsonify(state)
 @app.get('/')
