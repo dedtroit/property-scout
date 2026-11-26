@@ -106,7 +106,7 @@ def normalize(raw, source):
     if not address:return
     photos=raw.get('photos') or []; photos=photos if isinstance(photos,list) else [photos]
     link=safeurl(raw.get('listing_url') or raw.get('url'))
-    return dict(closing_status=close,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',address=address,city=city,price=price,source=source,distress=match.group(),financing=financing,remarks=remarks[:1800],photos=[safeurl(p) for p in photos if safeurl(p)],url=link,search_url='https://www.google.com/search?q='+quote_plus(address+' '+city+' CA real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address+' '+city+' CA'))
+    return dict(**property_attributes(raw),closing_status=close,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',address=address,city=city,price=price,source=source,distress=match.group(),financing=financing,remarks=remarks[:1800],photos=[safeurl(p) for p in photos if safeurl(p)],url=link,search_url='https://www.google.com/search?q='+quote_plus(address+' '+city+' CA real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address+' '+city+' CA'))
 def reserve_request(detail=False):
     # Persist on a mounted Railway volume; rolling 31-day cap protects billing cycles.
     path=os.getenv('QUOTA_DB','/data/quota.sqlite3')
@@ -239,12 +239,15 @@ def rentcast_scan():
         db.execute('BEGIN IMMEDIATE')
         db.execute('DELETE FROM calls WHERE ts < ?',(now-31*86400,))
         count=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
+        db.execute('CREATE TABLE IF NOT EXISTS rent_calls (ts REAL)')
+        db.execute('DELETE FROM rent_calls WHERE ts < ?',(now-31*86400,))
+        rent_count=db.execute('SELECT COUNT(*) FROM rent_calls').fetchone()[0]
         last=db.execute('SELECT MAX(ts) FROM calls').fetchone()[0] or 0
         # One bounded recovery request when the original result was never recorded.
         recovery=count<9
-        if count>=50 or (now-last<31*86400/50 and not recovery):
+        if count+rent_count>=50 or (now-last<31*86400/35 and not recovery):
             state['rentcast_diagnostics']={k:v for k,v in old.items() if k!='rows'}
-            state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/50,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
+            state['rentcast_diagnostics'].update({'used':count,'limit':50,'next_eligible':datetime.fromtimestamp(max(last+31*86400/35,(db.execute('SELECT MIN(ts) FROM calls').fetchone()[0] or 0)+31*86400 if count>=50 else 0),timezone.utc).isoformat()})
             return old['rows'],'RentCast: '+str(count)+'/50 requests; '+old.get('message','Previous request outcome was not recorded')+'; waiting for quota interval',False
         db.execute('CREATE TABLE IF NOT EXISTS city_cursor (id INTEGER PRIMARY KEY, next_index INTEGER)')
         cursor=db.execute('SELECT next_index FROM city_cursor WHERE id=1').fetchone()
@@ -260,7 +263,7 @@ def rentcast_scan():
         rows=[]; rejected=[]
         for x in batch:
             def reject(reason):
-                rejected.append({'source':'RentCast','address':x.get('formattedAddress') or x.get('addressLine1'),'city':x.get('city'),'price':listing_price(x),'type':x.get('propertyType'),'status':x.get('status'),'reason':reason})
+                rejected.append({**property_attributes(x),'source':'RentCast','address':x.get('formattedAddress') or x.get('addressLine1'),'city':x.get('city'),'price':listing_price(x),'type':x.get('propertyType'),'status':x.get('status'),'reason':reason})
             if str(x.get('city') or '').strip().title() not in CITIES or str(x.get('state')).upper()!='CA':reject('Outside target cities');continue
             price=listing_price(x)
             if price is None or not 0<price<260000:reject('Missing price or outside budget');continue
@@ -279,7 +282,7 @@ def rentcast_scan():
             if not address:reject('Missing address');continue
             dom=x.get('daysOnMarket')
             remarks='Listing type: '+(typ or 'Unknown')+'; days on market: '+str(dom if dom is not None else 'Unknown')+'. Seller motivation and financing require verification.'
-            rows.append(dict(address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
+            rows.append(dict(**property_attributes(x),type=x.get('propertyType'),address=address,city=str(x['city']).title(),price=price,source='RentCast',distress=label,hoa_verified=not bool(restriction),hoa_status=restriction or 'No HOA reported',closing_status='21-day closing unverified',financing='Financing unverified',remarks=remarks,photos=[],url='',search_url='https://www.google.com/search?q='+quote_plus(address+' real estate listing'),photo_search='https://www.google.com/search?tbm=isch&q='+quote_plus(address)))
         message=city+': '+str(len(batch))+' returned; '+str(len(rows))+' local budget candidates; '+str(len(rejected))+' rejected'+('; response at page limit; coverage may be incomplete' if len(batch)>=100 else '')
         rows=[x for x in old.get('rows',[]) if x.get('city')!=city]+rows
         rejected=[x for x in old.get('rejected',[]) if str(x.get('city') or '').title()!=city]+rejected
@@ -319,6 +322,88 @@ def merge_properties(records):
             unique[key]['reason']='; '.join(dict.fromkeys(x for x in (prior.get('reason'),row.get('reason')) if x))
     return list(unique.values())
 
+def property_attributes(raw):
+    p=raw.get('property') if isinstance(raw.get('property'),dict) else {}
+    result={}
+    for name,aliases in {'bedrooms':('bedrooms','beds','bedroomCount'),'bathrooms':('bathrooms','baths','bathroomCount'),'squareFootage':('squareFootage','sqft','livingArea','livingAreaSqFt','buildingArea'),'yearBuilt':('yearBuilt',)}.items():
+        for obj in (raw,p):
+            for alias in aliases:
+                try:
+                    val=float(str(obj.get(alias,'')).replace(',',''))
+                    if val>0 and val<100000:
+                        result[name]=val
+                        break
+                except (ValueError,TypeError):pass
+            if name in result:break
+    return result
+
+def rent_address(row):
+    a=row.get('address') or ''
+    city=str(row.get('city') or '').strip()
+    if isinstance(a,dict):
+        city=city or str(a.get('city') or '')
+        a=a.get('full') or a.get('streetAddress') or a.get('street') or ''
+    a=str(a).strip()
+    if not re.match(r'^\d+\s+',a):return ''
+    if re.search(r',\s*[^,]+,\s*(CA|California)(?:\s+\d{5}(?:-\d{4})?)?\s*$',a,re.I):return a
+    return a+', '+city+', CA' if city else ''
+
+def rent_estimates_scan():
+    key=os.getenv('RENTCAST_API_KEY')
+    path=Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('rentcast.sqlite3')
+    path.parent.mkdir(parents=True,exist_ok=True)
+    cache=path.with_name('rental_estimates.json')
+    try: records=json.loads(cache.read_text())
+    except Exception:records={}
+    state['rental_estimates']=records
+    if not key:return
+    now=time.time()
+    def rank(x):
+        city=property_key(x).split('|')[-1]
+        return (city not in {re.sub(r'[^a-z0-9]','',c.lower()) for c in CITIES},'Historical' in str(x.get('reason','')),not bool(x.get('url')),x.get('price') or 1e9)
+    candidates=merge_properties(state.get('listings',[]))+merge_properties(state.get('rejected',[]))
+    candidates=sorted(candidates,key=lambda x:(x.get('reason') is not None,rank(x)))
+    row=next((x for x in candidates if rent_address(x) and now-records.get(property_key(x),{}).get('attempted_epoch',0)> (30 if records.get(property_key(x),{}).get('rent') else 7)*86400),None)
+    with sqlite3.connect(path,timeout=15) as db:
+        db.execute('CREATE TABLE IF NOT EXISTS calls (ts REAL)')
+        db.execute('CREATE TABLE IF NOT EXISTS rent_calls (ts REAL)')
+        db.execute('BEGIN IMMEDIATE')
+        for table in ('calls','rent_calls'):db.execute('DELETE FROM '+table+' WHERE ts < ?',(now-31*86400,))
+        sales=db.execute('SELECT COUNT(*) FROM calls').fetchone()[0]
+        rentals=db.execute('SELECT COUNT(*) FROM rent_calls').fetchone()[0]
+        daily=db.execute('SELECT COUNT(*) FROM rent_calls WHERE ts >= ?',(now-86400,)).fetchone()[0]
+        state['rental_quota']={'sales':sales,'rental':rentals,'total':sales+rentals,'limit':50,'rental_limit':15}
+        if row is None or sales+rentals>=50 or rentals>=15 or daily>=2:return
+        db.execute('INSERT INTO rent_calls VALUES (?)',(now,))
+        state['rental_quota'].update({'rental':rentals+1,'total':sales+rentals+1})
+    ident=property_key(row); address=rent_address(row)
+    params={'address':address}
+    for name in ('bedrooms','bathrooms','squareFootage'):
+        if row.get(name) is not None:params[name]=row[name]
+    t=re.sub(r'[^a-z]','',str(row.get('type') or '').lower())
+    types={'singlefamily':'Single Family','singlefamilyhome':'Single Family','singlefamilyresidence':'Single Family','condominiumunit':'Condo','condominium':'Condo','condo':'Condo','townhouse':'Townhouse','manufacturedhome':'Manufactured','mobilehome':'Manufactured'}
+    if t in types:params['propertyType']=types[t]
+    try:
+        response=requests.get('https://api.rentcast.io/v1/avm/rent/long-term',params=params,headers={'X-Api-Key':key,'Accept':'application/json'},timeout=(10,40),allow_redirects=False)
+        response.raise_for_status();payload=response.json()
+        rent=payload.get('rent')
+        if not isinstance(rent,(int,float)) or rent<=0:raise ValueError('No rental estimate returned')
+        subject=payload.get('subjectProperty') or {}
+        # Do not assign another unit's valuation to this address.
+        actual=subject.get('formattedAddress') or subject.get('addressLine1') or ''
+        if not actual or property_key({'address':actual,'city':subject.get('city')})!=ident:raise ValueError('Subject address did not match')
+        comps=[]
+        for c in (payload.get('comparables') or [])[:12]:
+            if isinstance(c,dict):
+                comps.append({k:c.get(k) for k in ('formattedAddress','propertyType','bedrooms','bathrooms','squareFootage','yearBuilt','price','status','distance','daysOld','listedDate','lastSeenDate','correlation')})
+        rec={'rent':rent,'low':payload.get('rentRangeLow'),'high':payload.get('rentRangeHigh'),'subject':{k:subject.get(k) for k in ('formattedAddress','propertyType','bedrooms','bathrooms','squareFootage','yearBuilt')},'comparables':comps,'checked':datetime.now(timezone.utc).isoformat(),'attempted_epoch':now,'source':'RentCast','status':'success'}
+        print('Rent valuation succeeded; '+str(len(comps))+' comparable records',flush=True)
+    except Exception as e:
+        rec={**records.get(ident,{}),'attempted_epoch':now,'status':'error','error':('HTTP '+str(e.response.status_code) if isinstance(e,requests.HTTPError) else str(e)[:120] if isinstance(e,ValueError) else type(e).__name__)}
+        print('Rent valuation failed: '+rec['error'],flush=True)
+    records[ident]=rec
+    tmp=cache.with_suffix('.tmp');tmp.write_text(json.dumps(records));tmp.replace(cache);state['rental_estimates']=records
+
 def scan():
     if not lock.acquire(False):return
     state['running']=True; rows=[]; errors=[]; successes=0; rejected=[]; completed_zips=[]; zip_records={}
@@ -349,7 +434,7 @@ def scan():
                         source=re.sub(r'[^a-z0-9]','',str(item.get('source','')).lower())
                         source={'homepath':'fanniemae','homesteps':'freddiemac','hudhomestore':'hud'}.get(source,source)
                         def reject(reason):
-                            rejected.append({'reason':reason,'address':item.get('address'),'city':item.get('city'),'price':listing_price(item,source),'price_fields':{k:v for k,v in item.items() if 'price' in k.lower() and isinstance(v,(str,int,float))},'source':source,'type':item.get('propertyType'),'status':item.get('status'),'url':safeurl(item.get('propertyLink') or item.get('url'))})
+                            rejected.append({**property_attributes(item),'reason':reason,'address':item.get('address'),'city':item.get('city'),'price':listing_price(item,source),'price_fields':{k:v for k,v in item.items() if 'price' in k.lower() and isinstance(v,(str,int,float))},'source':source,'type':item.get('propertyType'),'status':item.get('status'),'url':safeurl(item.get('propertyLink') or item.get('url'))})
                         a=item.get('address') or ''
                         if isinstance(a,dict):
                             city=a.get('city') or item.get('city')
@@ -454,6 +539,9 @@ def scan():
             state['rejected']=rejected
             Path(os.getenv('QUOTA_DB','/data/quota.sqlite3')).with_name('rejected.json').write_text(json.dumps(rejected))
         state['errors']=errors;state['updated']=datetime.now(timezone.utc).isoformat()
+        try:rent_estimates_scan()
+        except Exception as e:
+            print('Rent estimate scanner: '+type(e).__name__,flush=True)
         print('Scan complete: '+str(len(state['listings']))+' candidates; '+str(len(state['rejected']))+' rejected',flush=True)
         diagnostics=provider_cache.with_name('scan_diagnostics.json');tmp=diagnostics.with_suffix('.tmp');tmp.write_text(json.dumps({k:state.get(k) for k in ('errors','updated','rentcast_diagnostics','foreclosure_diagnostics')}));tmp.replace(diagnostics)
     finally:state['running']=False;lock.release()
@@ -463,6 +551,8 @@ def loop():
         if cache.exists():state['listings']=[x for x in json.loads(cache.read_text()) if (x.get('hoa_status') in ('HOA status unverified','No HOA reported') or x.get('hoa_verified') is True) and x.get('closing_status')!='Closing too short']
         diagnostics=cache.with_name('scan_diagnostics.json')
         if diagnostics.exists():state.update(json.loads(diagnostics.read_text()))
+        rent_cache=cache.with_name('rental_estimates.json')
+        if rent_cache.exists():state['rental_estimates']=json.loads(rent_cache.read_text())
         reject_cache=cache.with_name('rejected.json')
         if reject_cache.exists():state['rejected']=json.loads(reject_cache.read_text())
     except Exception:pass
@@ -486,6 +576,9 @@ def listings():
             row['sources']=list(dict.fromkeys(row.get('sources',[])+other.get('sources',[])))
             row['listing_links']=list(dict.fromkeys(row.get('listing_links',[])+other.get('listing_links',[])))
     snapshot['rejected']=[x for x in rejected if property_key(x) not in keys]
+    estimates=snapshot.pop('rental_estimates',{})
+    for row in snapshot['listings']+snapshot['rejected']:
+        row['rent_estimate']=estimates.get(property_key(row))
     return jsonify(snapshot)
 @app.get('/')
 def home():return render_template_string(r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Property Scout</title><style>
@@ -498,6 +591,8 @@ def home():return render_template_string(r'''<!doctype html><html lang="en"><hea
 body{background:#f4f6f3}main{max-width:1540px;padding:28px 32px 60px;display:grid;grid-template-columns:216px minmax(0,1fr);column-gap:28px;align-items:start}header{grid-column:1/-1;border-bottom:1px solid var(--line);padding-bottom:21px;margin-bottom:22px}header h1{font-size:32px;letter-spacing:-1.4px}nav{grid-column:1;grid-row:2/span 5;align-self:start;position:sticky;top:20px;display:flex;flex-direction:column;gap:4px;padding:4px 0;border:0;background:transparent}nav:before{content:"WORKSPACE";font-size:10px;letter-spacing:1.5px;color:#738075;font-weight:750;padding:7px 12px}nav button{display:flex;justify-content:space-between;text-align:left;align-items:center;gap:10px;font-size:13px;padding:10px 12px;border:1px solid transparent;font-weight:600}nav button[aria-current=true]{background:#e1ebe2;color:#22563e;border-color:#d3e0d4}nav button span{font-weight:650;font-size:11px}nav button[data-tab=sources]{margin-top:15px;border-top:1px solid var(--line);border-radius:0}#filters,#cityChips,.stats,#listingPanel,#sourcePanel,footer{grid-column:2}#filters{margin:0 0 12px;box-shadow:0 1px 2px #14251b05;gap:10px}#cityChips{margin:0 0 14px}.stats{margin-bottom:0}.toolbar{margin-top:24px}.toolbar small{max-width:590px}.notice{border-left:3px solid #d0ad73;margin-top:14px}.table-shell{background:#fff;border:1px solid var(--line);border-radius:12px;overflow-x:auto;box-shadow:0 1px 3px #10281a08}.inventory{width:100%;border-collapse:collapse;text-align:left;min-width:740px;font-size:13px}.inventory thead th{background:#f9faf8;border-bottom:1px solid var(--line);padding:11px 15px;color:#66776b;font-size:10px;font-weight:750;text-transform:uppercase;letter-spacing:.6px;white-space:nowrap}.inventory td{padding:13px 15px;border-bottom:1px solid #edf0eb;vertical-align:middle}.inventory tbody tr:last-child td{border-bottom:0}.inventory tbody tr:hover{background:#fafbf9}.inventory tr.is-new td:first-child{border-left:3px solid #367b55;padding-left:12px}.inventory tr.is-seen td:first-child{border-left:3px solid transparent;padding-left:12px}.property-link{display:block;max-width:100%;border:0;padding:0;background:transparent;font-weight:700;font-size:13px;color:#203f2e;text-align:left;white-space:normal}.property-link:hover{text-decoration:underline}.cell-secondary{font-size:11px;color:var(--muted);margin-top:4px}.cell-price{font-size:15px;font-weight:750;white-space:nowrap;font-variant-numeric:tabular-nums}.cell-fit{min-width:160px;max-width:280px}.cell-fit .cell-secondary{line-height:1.4;overflow-wrap:anywhere}.cell-actions{display:flex;gap:5px;align-items:center}.cell-actions button{font-size:11px;padding:7px 9px;white-space:nowrap}.cell-actions button[aria-pressed=true]{background:#e1eee2;color:#22563e}.cell-actions .open{background:#255d46;color:white;border-color:#255d46}.tag.outside{background:#f5eadc;color:#795422}.tag.unknown{background:#e9edf2;color:#465b73}.tag.fits{background:#e1eee3;color:#285d40}.tag.seen{background:#f1f3ef;color:#6e7c73}.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;color:var(--muted);font-size:12px}.pager button{font-size:12px}.pager button:disabled{opacity:.4;cursor:default}dialog{position:fixed;inset:0 0 0 auto;margin:0;width:min(590px,100vw);max-width:100vw;height:100dvh;max-height:100dvh;border:0;border-left:1px solid var(--line);padding:0;background:#fff;color:var(--ink);box-shadow:-12px 0 45px #16281b20}dialog::backdrop{background:#192b2270}#detailBody{padding:22px 24px 40px}.drawer-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px}.drawer-head h2{font-size:23px;letter-spacing:-.6px;line-height:1.3;margin:7px 0}.drawer-head button{font-size:13px}.drawer-price{font-size:35px;font-weight:750;letter-spacing:-1px;line-height:1.3;margin:10px 0}.drawer-section{border-top:1px solid var(--line);padding-top:16px;margin-top:19px}.drawer-section h3{font-size:14px;margin:0 0 10px}.drawer-metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}.drawer-metrics div{background:#f4f7f3;border-radius:8px;padding:12px}.drawer-metrics strong{display:block;font-size:20px}.criteria-row{display:grid;grid-template-columns:130px minmax(0,1fr);gap:10px;padding:9px 0;border-bottom:1px solid #edf0ed;font-size:13px}.criteria-row:last-child{border:0}.criteria-row strong{font-size:12px}.drawer-note{width:100%;min-height:100px;resize:vertical;font:inherit;padding:12px;border:1px solid var(--line);border-radius:8px;background:#fafbf9;color:var(--ink)}.drawer-img{display:block;width:100%;max-height:235px;object-fit:cover;border-radius:10px;margin-top:15px}.drawer-source{display:flex;gap:8px;flex-wrap:wrap}.drawer-source a{color:#245d46;font-size:13px;border:1px solid var(--line);border-radius:8px;padding:9px 12px;text-decoration:none;font-weight:600}.drawer-source a:first-child{background:#245d46;color:white}.detail-raw{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px}.drawer-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:15px}.drawer-actions button{font-size:12px}.cards .property-link{font-size:15px}.cards .content{gap:12px}.cards .cover{max-height:190px}.cards .actions{padding-top:8px}footer{margin-top:22px} @media(max-width:950px){main{display:block;padding:20px 16px 48px}header{margin-bottom:8px}nav{position:sticky;top:0;flex-direction:row;overflow-x:auto;white-space:nowrap;background:#f4f6f3;padding:8px 0 12px;z-index:3;margin-bottom:8px}nav:before{display:none}nav button{flex-shrink:0;padding:8px 10px}nav button[data-tab=sources]{margin:0;border:1px solid transparent;border-radius:7px}#filters{margin:0 0 12px}.inventory{min-width:690px}#detailBody{padding:18px 16px 32px}}@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 
 .mortgage-total{background:#f0f6ef;border:1px solid #dce8db;border-radius:12px;padding:17px;margin:12px 0}.mortgage-total strong{display:block;font-size:34px;letter-spacing:-1px;line-height:1.2;color:#245d46;font-variant-numeric:tabular-nums}.mortgage-total small{font-size:12px}.mortgage-bar{display:flex;height:9px;border-radius:5px;overflow:hidden;background:#e4e9e2;margin-top:13px}.mortgage-line{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px;padding:5px 0}.mortgage-line i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px}.mortgage-fields{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:16px 0}.mortgage-fields label{display:grid;gap:5px;font-size:12px;font-weight:650;color:#58685e}.mortgage-fields input,.mortgage-fields select{width:100%;min-width:0;font-variant-numeric:tabular-nums}.mortgage-fields input[type=range]{accent-color:#245d46;padding:0;border:0}.mortgage-fields .wide{grid-column:1/-1}.mortgage-heading{display:flex;align-items:center;justify-content:space-between;gap:10px}.mortgage-heading h3{margin:0}.mortgage-heading button{font-size:11px}.mortgage-summary{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:12px 0}.mortgage-summary div{background:#f4f7f3;padding:12px;border-radius:8px}.mortgage-summary strong{display:block;font-size:19px;font-variant-numeric:tabular-nums}.mortgage-summary .cash{background:#e3eee3}.mortgage-note{font-size:11px;line-height:1.55;color:#697970}.payment-mini{font-size:11px;font-weight:650;color:#245d46;margin-top:4px}
+
+.rental-hero{display:flex;align-items:baseline;justify-content:space-between;gap:10px;padding:14px;background:#f0f6ef;border:1px solid #dce8db;border-radius:10px;margin:10px 0}.rental-hero strong{font-size:29px;color:#245d46;letter-spacing:-.7px}.rent-comps{overflow:auto;margin-top:10px}.rent-comps table{border-collapse:collapse;width:100%;font-size:12px;text-align:left}.rent-comps th,.rent-comps td{padding:9px 6px;border-bottom:1px solid #e6ebe4;vertical-align:top}.rent-comps th{font-size:10px;color:#65756b}.rent-comps td:not(:first-child){white-space:nowrap}.positive-flow{color:#245d46}.negative-flow{color:#9b4036}
 </style></head><body><main><header><div class="brand"><small>SACRAMENTO REGION / REAL ESTATE</small><h1>Property Scout</h1><p class="muted">Find homes below $260,000. No known HOA or mobile homes, conventional financing and 21 days to close.</p></div><div class="header-status"><span id="statusDot" class="status-dot"></span><span id="headerStatus">Connecting</span></div></header>
 <nav><button data-tab="all">All <span id="allCount"></span></button><button data-tab="matches">Meets filters <span id="matchCount"></span></button><button data-tab="review">Other listings <span id="reviewCount"></span></button><button data-tab="unviewed">Unviewed <span id="unviewedCount"></span></button><button data-tab="saved">Saved <span id="savedCount"></span></button><button data-tab="archived">Archived <span id="archiveCount"></span></button><button data-tab="sources">Sources</button></nav>
 <div id="filters" class="filters"><label class="field">Search<input id="search" type="search" placeholder="Address, city, reason"></label><label class="field">City<select id="city"><option value="">All cities</option>{% for c in cities %}<option>{{c}}</option>{% endfor %}<option value="other">Other cities</option></select></label><label class="field">Viewed<select id="viewFilter"><option value="">All</option><option value="new">Unviewed</option><option value="seen">Viewed</option></select></label><label class="field">Sort<select id="sort"><option value="new">Unviewed first</option><option value="low">Lowest price</option><option value="high">Highest price</option><option value="city">City</option></select></label><label class="field">Eligibility<select id="eligibility"><option value="">Any status</option><option value="fits">Meets filters</option><option value="outside">Outside criteria</option><option value="unknown">Missing information</option></select></label><label class="field">Down payment (%)<input id="down" type="number" min="0" max="100" step="any" value="12" inputmode="decimal" style="width:108px"></label><label class="check"><input type="checkbox" id="verified"> Conventional mentioned</label><label class="check"><input type="checkbox" id="closingVerified"> 21 days indicated</label><button id="clearFilters" type="button">Reset filters</button></div><div id="cityChips" class="city-chips"></div>
@@ -552,7 +647,7 @@ function mortgagePanel(parent,x){
  field('Annual property tax (%)','tax',0,10,'any');field('Home insurance ($/month)','insurance',0,10000,'any');field('Annual PMI (% of loan)','pmi',0,5,'any');field('HOA ($/month, if any)','hoa',0,100000,'any',true);field('Closing costs (% of price)','closing',0,20,'any');
  const summary=add(f,'div',undefined,'mortgage-summary'),out={};for(const [label,prop] of [['Down payment','down'],['Loan amount','loan'],['Estimated closing costs','closing'],['Estimated cash to close','cash'],['Total loan interest','totalInterest']]){const item=add(summary,'div',undefined,prop==='cash'?'cash':'');add(item,'small',label);out[prop]=add(item,'strong')}
  const closingNote=add(f,'p',undefined,'mortgage-note');add(f,'p','Illustrative defaults: 6.5% rate, 30-year term, 1.25% annual property tax, $150/month insurance, 0.6% annual PMI and 3% closing costs. These are estimates, not live lender quotes or verified property expenses. HOA defaults to $0 until entered. PMI is estimated below 20% down on conventional loans; actual costs vary.','mortgage-note');
- function update(){const c=calculateMortgage(scenario(x));totalNumber.textContent=money(c.total)+' /mo';for(const [,prop] of components){amounts[prop].textContent=money(c[prop]);segments[prop].style.width=(c.total?100*c[prop]/c.total:0)+'%'}for(const prop of Object.keys(out))out[prop].textContent=money(c[prop]);dollars.max=String(c.price);closingNote.textContent='Cash to close = '+money(c.down)+' down + '+money(c.closing)+' estimated closing costs. Closing costs may include lender fees, appraisal, escrow, title, recording and prepaid taxes/insurance; excludes seller credits and deposits already paid.'}
+ function update(){const c=calculateMortgage(scenario(x));parent.querySelectorAll('.drawer-section').forEach(section=>section.dispatchEvent(new Event('mortgage-updated')));totalNumber.textContent=money(c.total)+' /mo';for(const [,prop] of components){amounts[prop].textContent=money(c[prop]);segments[prop].style.width=(c.total?100*c[prop]/c.total:0)+'%'}for(const prop of Object.keys(out))out[prop].textContent=money(c[prop]);dollars.max=String(c.price);closingNote.textContent='Cash to close = '+money(c.down)+' down + '+money(c.closing)+' estimated closing costs. Closing costs may include lender fees, appraisal, escrow, title, recording and prepaid taxes/insurance; excludes seller credits and deposits already paid.'}
  update()
 }
 function distinct(rows){const m=new Map();for(const x of rows){const k=key(x);if(!m.has(k))m.set(k,x);else{const a=m.get(k);m.set(k,{...a,sources:[...new Set([...(a.sources||[a.source]),...(x.sources||[x.source])])],listing_links:[...new Set([...(a.listing_links||[a.url]),...(x.listing_links||[x.url])].filter(Boolean))]})}}return [...m.values()]}
@@ -564,6 +659,17 @@ function eligibility(x){
     return {kind:outside?'outside':'unknown',label:outside?'Outside criteria':'Missing information',reason};
 }
 function sourceLabel(x){const labels={fanniemae:'HomePath',freddiemac:'HomeSteps',hud:'HUD',redfin:'Redfin',RentCast:'RentCast'};return [...new Set((x.sources||[x.source||'Unknown']).filter(Boolean).map(v=>labels[v]||v))].join(', ')}
+function rentPanel(parent,x){
+ const f=add(parent,'section',undefined,'drawer-section');add(f,'h3','Rental income estimate');const est=x.rent_estimate||{},valid=Number(est.rent)>0,hero=add(f,'div',undefined,'rental-hero');const main=add(hero,'div');add(main,'small','RentCast market rent');add(main,'strong',valid?money(est.rent)+'/mo':'Not available');if(valid&&est.low!=null&&est.high!=null)add(hero,'small',money(est.low)+'–'+money(est.high)+'/mo');
+ if(valid){const sub=est.subject||{},facts=[sub.propertyType,sub.bedrooms!=null?sub.bedrooms+' beds':'',sub.bathrooms!=null?sub.bathrooms+' baths':'',sub.squareFootage?Number(sub.squareFootage).toLocaleString()+' sqft':'',sub.yearBuilt?'Built '+sub.yearBuilt:''].filter(Boolean);add(f,'p',facts.join(' · '),'muted');add(f,'small','Valuation retrieved '+new Date(est.checked).toLocaleDateString()+'. Comparable asking rents may differ from signed leases. Property condition, rental restrictions and repairs require verification.');if(est.status==='error')add(f,'p','Last refresh failed; showing the prior estimate.','mortgage-note')}
+ else add(f,'p',est.error?'Provider could not verify this address: '+est.error:'Address-level rental valuation is queued automatically within the shared API allowance. No rent estimate is invented.','mortgage-note');
+ const comps=est.comparables||[];if(comps.length){const d=add(f,'details');add(d,'summary','Nearby comparable rentals ('+comps.length+')');const wrap=add(d,'div',undefined,'rent-comps'),t=add(wrap,'table'),head=add(add(t,'thead'),'tr');for(const h of ['Address','Rent','Beds / baths','Size','Distance','Status'])add(head,'th',h);const body=add(t,'tbody');for(const c of comps){const tr=add(body,'tr'),ad=add(tr,'td');link(ad,'https://www.google.com/search?q='+encodeURIComponent((c.formattedAddress||'')+' rental listing'),c.formattedAddress||'Unknown');if(c.daysOld!=null)add(ad,'small',c.daysOld+' days old');add(tr,'td',c.price!=null?money(c.price):'Unknown');add(tr,'td',(c.bedrooms??'?')+' / '+(c.bathrooms??'?'));add(tr,'td',c.squareFootage?Number(c.squareFootage).toLocaleString():'Unknown');add(tr,'td',c.distance!=null?Number(c.distance).toFixed(2)+' mi':'Unknown');add(tr,'td',c.status||'Unknown')}}
+ const k=key(x);let assumptions=load('propertyScoutRentalV1',{})||{};const local=assumptions[k]||{},fields=add(f,'div',undefined,'mortgage-fields');function input(label,prop,value,max){const l=add(fields,'label',label),i=add(l,'input');i.type='number';i.min='0';i.max=String(max);i.step='any';i.value=value==null?'':String(value);i.oninput=()=>{if(i.value===''){delete local[prop]}else if(i.validity.valid)local[prop]=Number(i.value);else return;assumptions[k]=local;store('propertyScoutRentalV1',assumptions);update()};return i}
+ const rent=input('Monthly rent override ($)','rent',local.rent??(valid?est.rent:null),100000),vac=input('Vacancy reserve (%)','vacancy',local.vacancy??5,100),maint=input('Maintenance reserve (%)','maintenance',local.maintenance??8,100),mgmt=input('Management fee (%)','management',local.management??8,100);
+ const grid=add(f,'div',undefined,'mortgage-summary'),out={};for(const [label,k] of [['Gross rental yield','yield'],['Monthly operating reserves','reserves'],['Estimated monthly cash flow','flow'],['Annual cash-on-cash return','coc']]){const item=add(grid,'div');add(item,'small',label);out[k]=add(item,'strong')}
+ function update(){const amount=rent.value===''?null:Number(rent.value);if(amount==null||!hasPrice(x)){Object.values(out).forEach(n=>n.textContent='Not available');return}const c=calculateMortgage(scenario(x)),reserve=amount*(Number(vac.value||0)+Number(maint.value||0)+Number(mgmt.value||0))/100,flow=amount-reserve-c.total;out.yield.textContent=(amount*12/c.price*100).toFixed(1)+'%';out.reserves.textContent=money(reserve);out.flow.textContent=money(flow)+'/mo';out.flow.className=flow>=0?'positive-flow':'negative-flow';out.coc.textContent=c.cash>0?(flow*12/c.cash*100).toFixed(1)+'%':'Not available'}
+ f.addEventListener('mortgage-updated',update);update();add(f,'p','Cash flow subtracts estimated mortgage payment, taxes, insurance, PMI, HOA, vacancy, maintenance and management. Excludes major capital repairs, utilities paid by owner, income taxes and financing changes; adjust assumptions before relying on it.','mortgage-note');
+}
 function showDetails(x){selected=x;mark(x,true,true);drawDetails();const d=el('propertyDialog');if(!d.open)d.showModal()}
 function drawDetails(){if(!selected)return;const x=selected,k=key(x),fit=eligibility(x),city=cityOf(x),a=addr(x.address),p=el('detailBody');p.replaceChildren();const head=add(p,'div',undefined,'drawer-head'),left=add(head,'div');add(left,'small',sourceLabel(x));const h=add(left,'h2',a);h.id='detailTitle';add(left,'small',city||'City unverified');button(head,'Close',()=>el('propertyDialog').close());add(p,'div',hasPrice(x)?money(x.price):'Price unavailable','drawer-price');const tags=add(p,'div',undefined,'tags');tag(tags,fit.label,fit.kind);tag(tags,seen(x)?'Viewed':'Unviewed',seen(x)?'seen':'new');if(own(saved,k))tag(tags,'Saved');if(own(archived,k))tag(tags,'Archived');if(x.saved_snapshot)tag(tags,'Historical snapshot','unknown');
     if(x.photos?.length){const img=add(p,'img',undefined,'drawer-img');img.alt=a;img.onerror=()=>img.remove();img.src=x.photos[0]}
@@ -573,16 +679,17 @@ function drawDetails(){if(!selected)return;const x=selected,k=key(x),fit=eligibi
     const criteria=[['Location',city?city+(cityOK?' · Target city':' · Outside target cities'):'Unknown'],['Asking price',hasPrice(x)?money(x.price)+(x.price<260000?' · Within budget':' · At or above budget'):'Unknown'],['Property type',x.type?type:!x.review?'Single family per listing filter':'Unverified'],['HOA',x.hoa_status||(reason.includes('hoa')?fit.reason:'Unverified')],['Financing',x.financing||(reason.includes('cash only')||reason.includes('financing restriction')?fit.reason:'Unverified')],['Closing',x.closing_status||(reason.includes('closing')?fit.reason:'Unverified')]];
     for(const [label,value] of criteria){const row=add(sec,'div',undefined,'criteria-row');add(row,'strong',label);add(row,'span',value)}
     if(hasPrice(x))mortgagePanel(p,x);
+    rentPanel(p,x);
     const sources=add(p,'section',undefined,'drawer-section');add(sources,'h3','Research this property');const links=add(sources,'div',undefined,'drawer-source');const urls=[...new Set([x.url,...(x.listing_links||[])].filter(Boolean))];urls.forEach((u,i)=>link(links,u,i?'Source '+(i+1):'Open listing'));link(links,x.search_url||'https://www.google.com/search?q='+encodeURIComponent(a+' '+city+' CA real estate listing'),'Search web');link(links,'https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(a+' '+city+' CA'),'Map');link(links,x.photo_search||'https://www.google.com/search?tbm=isch&q='+encodeURIComponent(a+' '+city),'Photos');if(x.remarks)add(sources,'p',x.remarks,'detail-raw');
     const research=add(p,'section',undefined,'drawer-section');add(research,'h3','Private research notes');const t=add(research,'textarea',undefined,'drawer-note');t.value=notes[k]||'';t.placeholder='Questions for the agent, offer strategy, follow-up…';t.setAttribute('aria-label','Private research notes');t.oninput=()=>{notes[k]=t.value;store('propertyScoutNotesV1',notes)};add(research,'small','Automatically saved in this browser.')
 }
-function renderTable(grid,rows){const shell=add(grid,'div',undefined,'table-shell'),table=add(shell,'table',undefined,'inventory'),head=add(table,'thead'),tr=add(head,'tr');for(const h of ['Property','Asking price','Eligibility','Activity','Actions'])add(tr,'th',h);const body=add(table,'tbody');for(const x of rows){const k=key(x),f=eligibility(x),row=add(body,'tr',undefined,seen(x)?'is-seen':'is-new'),a=add(row,'td'),b=button(a,addr(x.address),()=>showDetails(x));b.className='property-link';add(a,'div',[cityOf(x),sourceLabel(x)].filter(Boolean).join(' · '),'cell-secondary');const price=add(row,'td');add(price,'div',hasPrice(x)?money(x.price):'Unknown','cell-price');if(hasPrice(x)){const calc=calculateMortgage(scenario(x));add(price,'div',money(calc.total)+'/mo est.','payment-mini');add(price,'div',money(calc.cash)+' cash to close est.','cell-secondary')}const e=add(row,'td',undefined,'cell-fit');tag(e,f.label,f.kind);if(x.review||x.review_note||x.saved_snapshot)add(e,'div',f.reason,'cell-secondary');const activity=add(row,'td');tag(activity,seen(x)?'Viewed':'Unviewed',seen(x)?'seen':'new');if(notes[k])add(activity,'div','Has notes','cell-secondary');const actions=add(add(row,'td'),'div',undefined,'cell-actions');button(actions,'Details',()=>showDetails(x)).className='open';button(actions,own(saved,k)?'Saved':'Save',()=>save(x),own(saved,k));button(actions,own(archived,k)?'Restore':'Archive',()=>archive(x))}
+function renderTable(grid,rows){const shell=add(grid,'div',undefined,'table-shell'),table=add(shell,'table',undefined,'inventory'),head=add(table,'thead'),tr=add(head,'tr');for(const h of ['Property','Asking price','Rent estimate','Eligibility','Activity','Actions'])add(tr,'th',h);const body=add(table,'tbody');for(const x of rows){const k=key(x),f=eligibility(x),row=add(body,'tr',undefined,seen(x)?'is-seen':'is-new'),a=add(row,'td'),b=button(a,addr(x.address),()=>showDetails(x));b.className='property-link';add(a,'div',[cityOf(x),sourceLabel(x)].filter(Boolean).join(' · '),'cell-secondary');const price=add(row,'td');add(price,'div',hasPrice(x)?money(x.price):'Unknown','cell-price');if(hasPrice(x)){const calc=calculateMortgage(scenario(x));add(price,'div',money(calc.total)+'/mo est.','payment-mini');add(price,'div',money(calc.cash)+' cash to close est.','cell-secondary')}const rental=add(row,'td');const re=x.rent_estimate;if(re?.rent){add(rental,'div',money(re.rent)+'/mo','cell-price');if(re.low!=null&&re.high!=null)add(rental,'div',money(re.low)+'–'+money(re.high),'cell-secondary')}else add(rental,'small',re?.error?'Unavailable':'Pending');const e=add(row,'td',undefined,'cell-fit');tag(e,f.label,f.kind);if(x.review||x.review_note||x.saved_snapshot)add(e,'div',f.reason,'cell-secondary');const activity=add(row,'td');tag(activity,seen(x)?'Viewed':'Unviewed',seen(x)?'seen':'new');if(notes[k])add(activity,'div','Has notes','cell-secondary');const actions=add(add(row,'td'),'div',undefined,'cell-actions');button(actions,'Details',()=>showDetails(x)).className='open';button(actions,own(saved,k)?'Saved':'Save',()=>save(x),own(saved,k));button(actions,own(archived,k)?'Restore':'Archive',()=>archive(x))}
 }
 function renderCard(grid,x){const k=key(x),v=seen(x),review=!!x.review,photos=Array.isArray(x.photos)?x.photos:[],city=cityOf(x),address=addr(x.address);const card=add(grid,'article',undefined,'property'+(!v?' fresh':' reviewed')+(!photos.length?' noimage':''));const cover=add(card,'div','Photo unavailable','cover');if(photos.length){const img=document.createElement('img');img.alt=address;img.loading='lazy';img.onload=()=>cover.replaceChildren(img);img.src=photos[0]}
 const body=add(card,'div',undefined,'content'),top=add(body,'div',undefined,'top'),title=add(top,'div');add(title,'div',hasPrice(x)?money(x.price):'Price unknown','price');button(title,address,()=>showDetails(x)).className='property-link';if(city&&!address.toLowerCase().includes(city.toLowerCase()))add(title,'small',city+', CA');const labels=add(top,'div',undefined,'tags');tag(labels,v?'Viewed':'Unviewed',v?'':'new');const fit=eligibility(x);tag(labels,fit.label,fit.kind);if(own(archived,k))tag(labels,'Archived');if(own(saved,k))tag(labels,'Saved');
 if(review||x.review_note)add(body,'div',x.reason||x.review_note||'Review eligibility','reason');const tags=add(body,'div',undefined,'tags');if(x.type)tag(tags,String(x.type).replace(/_/g,' '));if(x.distress)tag(tags,x.distress);if(!review){tag(tags,x.hoa_status||'HOA unknown',x.hoa_verified?'':'warning');tag(tags,x.financing||'Financing unverified','warning');tag(tags,x.closing_status||'21 days unverified','warning')}if(x.saved_snapshot)tag(tags,'Saved snapshot','warning');
 if(hasPrice(x)){const calc=calculateMortgage(scenario(x)),n=add(body,'div',undefined,'numbers');add(n,'span',money(calc.total)+'/mo est.');add(n,'span',money(calc.cash)+' cash to close est.')}
-add(body,'small','Sources: '+(x.sources||[x.source||'Unknown']).filter(Boolean).join(', '));if(v&&viewed[k])add(body,'small','Viewed '+new Date(viewed[k]).toLocaleDateString('en-US'),'meta');if(x.remarks){const d=add(body,'details');d.dataset.key=k;d.open=openDetails.has(k);d.ontoggle=()=>{if(d.open)openDetails.add(k);else openDetails.delete(k)};add(d,'summary','Property details');add(d,'p',x.remarks)}
+if(x.rent_estimate?.rent)add(body,'div',money(x.rent_estimate.rent)+'/mo estimated rent','payment-mini');else add(body,'small','Rent estimate '+(x.rent_estimate?.error?'unavailable':'pending'));add(body,'small','Sources: '+(x.sources||[x.source||'Unknown']).filter(Boolean).join(', '));if(v&&viewed[k])add(body,'small','Viewed '+new Date(viewed[k]).toLocaleDateString('en-US'),'meta');if(x.remarks){const d=add(body,'details');d.dataset.key=k;d.open=openDetails.has(k);d.ontoggle=()=>{if(d.open)openDetails.add(k);else openDetails.delete(k)};add(d,'summary','Property details');add(d,'p',x.remarks)}
 const actions=add(body,'div',undefined,'actions');button(actions,'Property details',()=>showDetails(x));const urls=[...new Set([x.url,...(x.listing_links||[])].filter(Boolean))];if(urls.length){urls.forEach((url,i)=>link(actions,url,i===0?'Open listing':'Other source '+(i+1),()=>mark(x,true,true)))}else link(actions,x.search_url||'https://www.google.com/search?q='+encodeURIComponent(address+' '+city+' real estate listing'),'Find listing',()=>mark(x,true,true));button(actions,own(saved,k)?'Unsave':'Save',()=>save(x),own(saved,k));button(actions,v?'Mark unviewed':'Mark viewed',()=>mark(x,!v),v);button(actions,own(archived,k)?'Restore':'Archive',()=>archive(x),own(archived,k)).className='quiet';link(actions,x.photo_search||'https://www.google.com/search?tbm=isch&q='+encodeURIComponent(address+' '+city),'Photos');link(actions,'https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(address+' '+city),'Map')}
 const openDetails=new Set();function render(){const matches=distinct((data.listings||[]).map(x=>({...x,review:false}))),mk=new Set(matches.map(key)),review=distinct((data.rejected||[]).map(x=>({...x,review:true}))).filter(x=>!mk.has(key(x))),all=distinct([...matches,...review]),live=new Map(all.map(x=>[key(x),x]));const active=all.filter(x=>!own(archived,key(x))),archiveRows=Object.entries(archived).map(([k,x])=>live.get(k)||{...x,saved_snapshot:true}),savedRows=Object.entries(saved).map(([k,x])=>live.get(k)||{...x,saved_snapshot:true});
 el('allCount').textContent=active.length;el('matchCount').textContent=matches.filter(x=>!own(archived,key(x))).length;el('reviewCount').textContent=review.filter(x=>!own(archived,key(x))).length;el('savedCount').textContent=savedRows.length;el('archiveCount').textContent=archiveRows.length;el('unviewedCount').textContent=active.filter(x=>!seen(x)).length;document.querySelectorAll('nav button').forEach(b=>b.setAttribute('aria-current',String(b.dataset.tab===tab)));el('sourcePanel').hidden=tab!=='sources';el('listingPanel').hidden=tab==='sources';el('filters').hidden=tab==='sources';el('cityChips').hidden=tab==='sources';el('statusDot').className='status-dot'+(data.running?' running':!loaded?' error':'');el('headerStatus').textContent=data.running?'Scan running':loaded?'Connected':'Connecting';el('scanTime').textContent=data.updated?new Date(data.updated).toLocaleString('en-US',{timeZone:'America/Los_Angeles',month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})+' PT':'Waiting';el('scanState').textContent=data.running?'Scanning now':'Automatic scans';
